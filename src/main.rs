@@ -8,12 +8,6 @@ use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 
-#[derive(Parser)]
-struct Args {
-    #[arg(short, long)]
-    config: String,
-}
-
 #[derive(Deserialize)]
 struct Config {
     src_dir: String,
@@ -23,34 +17,15 @@ struct Config {
     exclude_list: Option<Vec<String>>,
 }
 
-fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
-    log::info!("initializing");
-    let args = Args::parse();
-
-    log::info!("reading config \"{}\"", args.config);
-    let config_str = match fs::read_to_string(&args.config) {
-        Ok(config_str) => config_str,
-        Err(err) => {
-            log::error!("read \"{}\" to string error: {}", args.config, err);
-            return;
-        }
-    };
-    let config: Config = match toml::from_str(&config_str) {
-        Ok(config) => config,
-        Err(err) => {
-            log::error!("parse config error: {}", err);
-            return;
-        }
-    };
+fn main() -> Result<()> {
+    let config = initialize()?;
 
     log::info!("checking path \"{}\"", config.src_dir);
     let src_metadata = match fs::metadata(&config.src_dir) {
         Ok(src_metadata) => src_metadata,
         Err(err) => {
             log::error!("read metadata of \"{}\" error: {}", config.src_dir, err);
-            return;
+            return Ok(());
         }
     };
     if !src_metadata.is_dir() {
@@ -58,13 +33,13 @@ fn main() {
             "check source path \"{}\" error: not a directory",
             config.src_dir
         );
-        return;
+        return Ok(());
     }
 
     log::info!("creating path \"{}\"", config.dest_dir);
     if let Err(err) = fs::create_dir_all(&config.dest_dir) {
         log::error!("create path \"{}\" error: {}", config.dest_dir, err);
-        return;
+        return Ok(());
     };
 
     log::info!("getting full path of src and dest");
@@ -72,7 +47,7 @@ fn main() {
         Ok(src_dir) => src_dir,
         Err(err) => {
             log::error!("get absolute path of \"{}\" error: {}", config.src_dir, err);
-            return;
+            return Ok(());
         }
     };
     let dest_dir = match fs::canonicalize(&config.dest_dir) {
@@ -83,7 +58,7 @@ fn main() {
                 config.dest_dir,
                 err
             );
-            return;
+            return Ok(());
         }
     };
 
@@ -100,7 +75,7 @@ fn main() {
                     entry,
                     err
                 );
-                return;
+                return Ok(());
             };
         }
         include_set
@@ -115,7 +90,7 @@ fn main() {
                 dest_dir.display(),
                 err
             );
-            return;
+            return Ok(());
         };
         dest_exist_set
     };
@@ -134,7 +109,7 @@ fn main() {
                     entry,
                     err
                 );
-                return;
+                return Ok(());
             }
         };
         if src_path.is_dir() {
@@ -156,7 +131,7 @@ fn main() {
                     entry,
                     err
                 );
-                return;
+                return Ok(());
             }
         };
         log::debug!("[ Compare ] {} {}", src_path.display(), dest_path.display());
@@ -169,7 +144,7 @@ fn main() {
                     dest_path.display(),
                     err
                 );
-                return;
+                return Ok(());
             }
         } {
             log::debug!("<- to: Overwrite List -> {}", entry);
@@ -235,6 +210,28 @@ fn main() {
             entry
         );
     }
+
+    Ok(())
+}
+
+#[derive(Parser)]
+#[command(author, version, about)]
+struct CliArgs {
+    #[arg(short, long, value_name = "FILE", help = "Specify configuration file", value_hint = clap::ValueHint::FilePath, default_value = "config")]
+    config: PathBuf,
+}
+
+fn initialize() -> Result<Config> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    let cli_args = CliArgs::parse();
+
+    log::info!("Reading \"{}\"", cli_args.config.display());
+    let config_slice = fs::read(&cli_args.config).map_err(|err| {
+        anyhow::anyhow!("reading \"{}\" failed: {}", cli_args.config.display(), err)
+    })?;
+    food_rs::config::parse(&config_slice)
+        .map_err(|err| anyhow::anyhow!("parsing config failed: {}", err))
 }
 
 fn path(prefix: &Path, entry: &str) -> Result<PathBuf> {

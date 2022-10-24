@@ -1,14 +1,17 @@
 [package]
-name = "reverso"
-version = "0.1.0"
+name = "chroni"
+version = "0.2.0"
 edition = "2021"
+authors = ["猫羽黑夜 <THE_cattail@k-neco.moe>"]
+description = "A mirror backup tool by Cattail Magic Lab"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 anyhow = "1.0"
-clap = { version = "4.0", features = ["derive"] }
+clap = { version = "4.0", features = ["cargo", "derive"] }
 env_logger = "0.9"
+food-rs = { version = "0.1.0", path = "../food-rs" }
 log = "0.4"
 md-5 = "0.10"
 serde = "1.0"

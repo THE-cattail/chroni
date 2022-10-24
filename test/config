@@ -1,0 +1,6 @@
+src_dir = "./src"
+dest_dir = "./dest"
+
+include_list = [
+    ""
+]
