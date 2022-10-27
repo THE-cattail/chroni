@@ -1,6 +1,7 @@
-src_dir = "./src"
-dest_dir = "./dest"
+[[tasks]]
+src = "./src"
+dest = "./dest"
 
-include_list = [
-    ""
+includes = [
+    "."
 ]
