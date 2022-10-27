@@ -375,16 +375,16 @@ fn overwrite(src: &Path, dest: &Path, entry: &Path) -> Result<()> {
     let dest_str = dest.display();
 
     let dest_new_tmp = {
-        let mut entry = entry.to_owned();
-        entry.push(SUFFIX_CHRONI_SRC);
-        entry
+        let mut path = dest.clone();
+        path.push(SUFFIX_CHRONI_SRC);
+        path
     };
     let dest_new_tmp_str = dest_new_tmp.display();
 
     let dest_old_tmp = {
-        let mut entry = entry.to_owned();
-        entry.push(SUFFIX_CHRONI_DEST);
-        entry
+        let mut path = dest.clone();
+        path.push(SUFFIX_CHRONI_DEST);
+        path
     };
     let dest_old_tmp_str = dest_old_tmp.display();
 
