@@ -108,53 +108,49 @@ fn process_task(task: &Task) -> Result<()> {
     let (add_list, overwrite_list, remove_list) =
         generate_to_do_list(&src, &dest, &include_files, &dest_exist_files)?;
 
-    log::info!("Execute remove list");
-    let remove_list_len = remove_list.len();
-    for (i, entry) in remove_list.iter().enumerate() {
-        if let Err(e) = remove(&dest, entry) {
-            log::warn!("{e}");
-        };
-        log::info!(
-            "[ {}% ] | [REMOVE] {}",
-            i * 100 / remove_list_len,
-            entry.display()
-        );
+    if !remove_list.is_empty() {
+        let remove_list_len = remove_list.len();
+        log::info!("Execute remove list");
+        for (i, entry) in remove_list.iter().enumerate() {
+            if let Err(e) = remove(&dest, entry) {
+                log::warn!("{e}");
+            };
+            log::info!(
+                "[ {}% ] | [REMOVE] {}",
+                i * 100 / remove_list_len,
+                entry.display()
+            );
+        }
     }
 
-    log::info!("Execute overwrite list");
-    let overwrite_list_len = overwrite_list.len();
-    for (i, entry) in overwrite_list.iter().enumerate() {
-        if let Err(e) = overwrite(&src, &dest, entry) {
-            log::warn!(
-                "overwrite \"{}\" to \"{}\" error: {}",
-                src.join(entry).display(),
-                dest.join(entry).display(),
-                e
+    if !overwrite_list.is_empty() {
+        log::info!("Execute overwrite list");
+        let overwrite_list_len = overwrite_list.len();
+        for (i, entry) in overwrite_list.iter().enumerate() {
+            if let Err(e) = overwrite(&src, &dest, entry) {
+                log::warn!("{e}");
+            };
+            log::info!(
+                "[ {}% ] | [OVERWRITE] {}",
+                i * 100 / overwrite_list_len,
+                entry.display()
             );
-        };
-        log::info!(
-            "[ {}% ] | [OVERWRITE] {}",
-            i * 100 / overwrite_list_len,
-            entry.display()
-        );
+        }
     }
 
-    log::info!("Execute add list");
-    let add_list_len = add_list.len();
-    for (i, entry) in add_list.iter().enumerate() {
-        if let Err(e) = add(&src, &dest, entry) {
-            log::warn!(
-                "add \"{}\" to \"{}\" error: {}",
-                src.join(entry).display(),
-                dest.join(entry).display(),
-                e
+    if !add_list.is_empty() {
+        log::info!("Execute add list");
+        let add_list_len = add_list.len();
+        for (i, entry) in add_list.iter().enumerate() {
+            if let Err(e) = add(&src, &dest, entry) {
+                log::warn!("{e}");
+            };
+            log::info!(
+                "[ {}% ] | [ADD] {}",
+                i * 100 / add_list_len,
+                entry.display()
             );
-        };
-        log::info!(
-            "[ {}% ] | [ADD] {}",
-            i * 100 / add_list_len,
-            entry.display()
-        );
+        }
     }
 
     println!("chroni: Backup complete.");
