@@ -245,15 +245,6 @@ fn file_same(src: &Path, dest: &Path) -> Result<bool> {
     if src_metadata.len() != dest_metadata.len() {
         return Ok(false);
     }
-    if food_rs::result!(
-        src_metadata.modified(),
-        "get modified time of source file \"{src_str}\" error: {}",
-    )? != food_rs::result!(
-        dest_metadata.modified(),
-        "get modified time of destination file \"{dest_str}\" error: {}",
-    )? {
-        return Ok(false);
-    }
 
     let mut src_file = food_rs::result!(
         File::open(src),
