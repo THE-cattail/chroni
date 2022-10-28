@@ -55,12 +55,12 @@ fn initialize() -> Result<Config> {
     log::info!("Reading \"{}\"", args.config.display());
     let config_slice = food_rs::result!(
         fs::read(&args.config),
-        "reading \"{}\" failed: {}",
+        "reading \"{}\" error: {}",
         args.config.display(),
     )?;
     food_rs::result!(
         food_rs::config::parse(&config_slice),
-        "parsing config failed: {}",
+        "parsing config error: {}",
     )
 }
 
@@ -108,50 +108,9 @@ fn process_task(task: &Task) -> Result<()> {
     let (add_list, overwrite_list, remove_list) =
         generate_to_do_list(&src, &dest, &include_files, &dest_exist_files)?;
 
-    if !remove_list.is_empty() {
-        let remove_list_len = remove_list.len();
-        log::info!("Execute remove list");
-        for (i, entry) in remove_list.iter().enumerate() {
-            if let Err(e) = remove(&dest, entry) {
-                log::warn!("{e}");
-            };
-            log::info!(
-                "[ {}% ] | [REMOVE] {}",
-                i * 100 / remove_list_len,
-                entry.display()
-            );
-        }
-    }
-
-    if !overwrite_list.is_empty() {
-        log::info!("Execute overwrite list");
-        let overwrite_list_len = overwrite_list.len();
-        for (i, entry) in overwrite_list.iter().enumerate() {
-            if let Err(e) = overwrite(&src, &dest, entry) {
-                log::warn!("{e}");
-            };
-            log::info!(
-                "[ {}% ] | [OVERWRITE] {}",
-                i * 100 / overwrite_list_len,
-                entry.display()
-            );
-        }
-    }
-
-    if !add_list.is_empty() {
-        log::info!("Execute add list");
-        let add_list_len = add_list.len();
-        for (i, entry) in add_list.iter().enumerate() {
-            if let Err(e) = add(&src, &dest, entry) {
-                log::warn!("{e}");
-            };
-            log::info!(
-                "[ {}% ] | [ADD] {}",
-                i * 100 / add_list_len,
-                entry.display()
-            );
-        }
-    }
+    execute_list("remove", &remove_list, remove, &src, &dest);
+    execute_list("overwrite", &overwrite_list, overwrite, &src, &dest);
+    execute_list("add", &add_list, add, &src, &dest);
 
     println!("chroni: Backup complete.");
 
@@ -166,12 +125,12 @@ fn collect_files(
 ) -> Result<()> {
     let path = prefix.join(entry);
     let path_str = path.display();
-    log::debug!("Traversing: \"{}\"", path_str);
+    log::debug!("Traversing: \"{path_str}\"");
 
     if let Some(exclude) = exclude {
         for exclude_entry in exclude {
             if entry.starts_with(exclude_entry) {
-                log::debug!("  ~ Skiped: \"{}\"", path_str);
+                log::debug!("  ~ Skiped: \"{path_str}\"");
                 return Ok(());
             }
         }
@@ -238,7 +197,7 @@ fn generate_to_do_list(
         let entry_str = entry.display();
 
         if !dest_exist_files.contains(entry) {
-            log::debug!("  + To add: {}", entry_str);
+            log::debug!("  + To add: {entry_str}");
             add_list.push(entry.clone());
             continue;
         }
@@ -248,16 +207,14 @@ fn generate_to_do_list(
         let src_str = src.display();
         let dest_str = dest.display();
 
-        log::debug!("? Comparing: \"{}\" & \"{}\"", src_str, dest_str);
+        log::debug!("? Comparing: \"{src_str}\" & \"{dest_str}\"");
         if food_rs::result!(
             file_same(&src, &dest),
-            "compare file \"{}\" with \"{}\" error: {}",
-            src_str,
-            dest_str,
+            "compare file \"{src_str}\" with \"{dest_str}\" error: {}",
         )? {
-            log::debug!("  ~ Skiped: {}", entry_str);
+            log::debug!("  ~ Skiped: {entry_str}");
         } else {
-            log::debug!("  ^ To overwrite: {}", entry_str);
+            log::debug!("  ^ To overwrite: {entry_str}");
             overwrite_list.push(entry.clone());
         }
     }
@@ -278,13 +235,11 @@ fn file_same(src: &Path, dest: &Path) -> Result<bool> {
 
     let src_metadata = food_rs::result!(
         src.metadata(),
-        "get metadata of source file \"{}\" error: {}",
-        src_str,
+        "get metadata of source file \"{src_str}\" error: {}",
     )?;
     let dest_metadata = food_rs::result!(
         dest.metadata(),
-        "get metadata of destination file \"{}\" error: {}",
-        dest_str,
+        "get metadata of destination file \"{dest_str}\" error: {}",
     )?;
 
     if src_metadata.len() != dest_metadata.len() {
@@ -292,12 +247,10 @@ fn file_same(src: &Path, dest: &Path) -> Result<bool> {
     }
     if food_rs::result!(
         src_metadata.modified(),
-        "get modified time of source file \"{}\" error: {}",
-        src_str,
+        "get modified time of source file \"{src_str}\" error: {}",
     )? != food_rs::result!(
         dest_metadata.modified(),
-        "get modified time of destination file \"{}\" error: {}",
-        dest_str,
+        "get modified time of destination file \"{dest_str}\" error: {}",
     )? {
         return Ok(false);
     }
@@ -310,47 +263,132 @@ fn file_same(src: &Path, dest: &Path) -> Result<bool> {
     let mut src_hasher = Md5::new();
     food_rs::result!(
         io::copy(&mut src_file, &mut src_hasher),
-        "copy source file \"{}\" to hasher error: {}",
-        src_str,
+        "copy source file \"{src_str}\" to hasher error: {}",
     )?;
     let src_hash = src_hasher.finalize();
 
     let mut dest_file = food_rs::result!(
         File::open(dest),
-        "open destination file \"{}\" error: {}",
-        dest_str,
+        "open destination file \"{dest_str}\" error: {}",
     )?;
     let mut dest_hasher = Md5::new();
     food_rs::result!(
         io::copy(&mut dest_file, &mut dest_hasher),
-        "copy destination file \"{}\" to hasher error: {}",
-        dest_str,
+        "copy destination file \"{dest_str}\" to hasher error: {}",
     )?;
     let dest_hash = dest_hasher.finalize();
 
     Ok(src_hash == dest_hash)
 }
 
-fn remove(dest: &Path, entry: &Path) -> Result<()> {
+fn execute_list(
+    name: &str,
+    list: &[PathBuf],
+    f: fn(&Path, &Path, &Path) -> Result<()>,
+    src: &Path,
+    dest: &Path,
+) {
+    if !list.is_empty() {
+        let list_len = list.len();
+        log::info!("Execute {name} list");
+        for (i, entry) in list.iter().enumerate() {
+            if let Err(e) = (f)(src, dest, entry) {
+                log::warn!("{e}");
+            };
+            log::info!(
+                "[ {}% ] | [{}] {}",
+                i * 100 / list_len,
+                name.to_uppercase(),
+                entry.display()
+            );
+        }
+    }
+}
+
+fn remove(_: &Path, dest: &Path, entry: &Path) -> Result<()> {
     let path = dest.join(entry);
+    let path_str = path.display();
+
+    log::debug!("* - Removing: {path_str}");
 
     food_rs::result!(
         if path.is_dir() {
+            log::trace!("remove dir");
             fs::remove_dir(&path)
         } else {
+            log::trace!("remove file");
             fs::remove_file(&path)
         },
-        "remove \"{}\" error: {}",
-        path.display(),
+        "remove \"{path_str}\" error: {}",
+    )?;
+
+    Ok(())
+}
+
+const SUFFIX_CHRONI_SRC: &str = "chroni_src";
+const SUFFIX_CHRONI_DEST: &str = "chroni_dest";
+
+fn overwrite(src: &Path, dest: &Path, entry: &Path) -> Result<()> {
+    let src = src.join(entry);
+    let src_str = src.display();
+
+    let dest = dest.join(entry);
+    let dest_str = dest.display();
+
+    let dest_new_tmp = {
+        let mut path = dest.clone();
+        path.set_extension(SUFFIX_CHRONI_SRC);
+        path
+    };
+    let dest_new_tmp_str = dest_new_tmp.display();
+
+    let dest_old_tmp = {
+        let mut path = dest.clone();
+        path.set_extension(SUFFIX_CHRONI_DEST);
+        path
+    };
+    let dest_old_tmp_str = dest_old_tmp.display();
+
+    log::debug!("* ^ Overwriting: {src_str} -> {dest_str}");
+
+    log::trace!("copy({src_str}, {dest_new_tmp_str})");
+    food_rs::result!(
+        fs::copy(&src, &dest_new_tmp),
+        "copy \"{src_str}\" for overwriting \"{dest_str}\" error: {}",
+    )?;
+
+    log::trace!("rename({dest_str}, {dest_old_tmp_str})");
+    food_rs::result!(
+        fs::rename(&dest, &dest_old_tmp),
+        "rename \"{dest_str}\" for overwriting \"{dest_str}\" error: {}",
+    )?;
+
+    log::trace!("rename({dest_new_tmp_str}, {dest_str})");
+    food_rs::result!(
+        fs::rename(&dest_new_tmp, &dest),
+        "rename \"{dest_new_tmp_str}\" for overwriting \"{dest_str}\" error: {}",
+    )?;
+
+    log::trace!("remove({dest_old_tmp_str})");
+    food_rs::result!(
+        fs::remove_file(&dest_old_tmp),
+        "remove \"{dest_old_tmp_str}\" for overwriting \"{dest_str}\" error: {}",
     )?;
 
     Ok(())
 }
 
 fn add(src: &Path, dest: &Path, entry: &Path) -> Result<()> {
+    let src = src.join(entry);
     let dest = dest.join(entry);
 
+    let src_str = src.display();
+    let dest_str = dest.display();
+
+    log::debug!("* + Adding: {src_str} -> {dest_str}");
+
     if let Some(parent) = dest.parent() {
+        log::trace!("create dir all");
         food_rs::result!(
             fs::create_dir_all(parent),
             "create directory \"{}\" for adding \"{}\" error: {}",
@@ -359,59 +397,7 @@ fn add(src: &Path, dest: &Path, entry: &Path) -> Result<()> {
         )?;
     }
 
-    let src = src.join(entry);
-    food_rs::result!(fs::copy(&src, dest), "copy \"{}\" error: {}", src.display(),)?;
-
-    Ok(())
-}
-
-const SUFFIX_CHRONI_SRC: &str = ".chroni_src";
-const SUFFIX_CHRONI_DEST: &str = ".chroni_dest";
-
-fn overwrite(src: &Path, dest: &Path, entry: &Path) -> Result<()> {
-    let src = src.join(entry);
-
-    let dest = dest.join(entry);
-    let dest_str = dest.display();
-
-    let dest_new_tmp = {
-        let mut path = dest.clone();
-        path.push(SUFFIX_CHRONI_SRC);
-        path
-    };
-    let dest_new_tmp_str = dest_new_tmp.display();
-
-    let dest_old_tmp = {
-        let mut path = dest.clone();
-        path.push(SUFFIX_CHRONI_DEST);
-        path
-    };
-    let dest_old_tmp_str = dest_old_tmp.display();
-
-    food_rs::result!(
-        fs::copy(&src, &dest_new_tmp),
-        "copy \"{}\" for overwriting \"{}\" error: {}",
-        src.display(),
-        dest_str,
-    )?;
-    food_rs::result!(
-        fs::rename(&dest, &dest_old_tmp),
-        "rename \"{}\" for overwriting \"{}\" error: {}",
-        dest_str,
-        dest_str,
-    )?;
-    food_rs::result!(
-        fs::rename(&dest_new_tmp, &dest),
-        "rename \"{}\" for overwriting \"{}\" error: {}",
-        dest_new_tmp_str,
-        dest_str,
-    )?;
-    food_rs::result!(
-        fs::remove_file(&dest_old_tmp),
-        "remove \"{}\" for overwriting \"{}\" error: {}",
-        dest_old_tmp_str,
-        dest_str,
-    )?;
+    food_rs::result!(fs::copy(&src, dest), "copy \"{src_str}\" error: {}",)?;
 
     Ok(())
 }
