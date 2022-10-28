@@ -30,11 +30,11 @@ fn main() -> Result<()> {
                 task.src.display(),
                 e
             );
-            print!("Continue? (Y/n): ");
             assert!(!food_rs::cli::ask_for_continue()?, "user aborted.");
         }
     }
 
+    println!("chroni: All tasks done.");
     Ok(())
 }
 
@@ -112,7 +112,7 @@ fn process_task(task: &Task) -> Result<()> {
     execute_list("overwrite", &overwrite_list, overwrite, &src, &dest);
     execute_list("add", &add_list, add, &src, &dest);
 
-    println!("chroni: Backup complete.");
+    println!("chroni: Task for {} done.", src.display());
 
     Ok(())
 }
