@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::Parser;
 use md5::{Digest, Md5};
 use serde_derive::Deserialize;
@@ -30,7 +30,9 @@ fn main() -> Result<()> {
                 task.src.display(),
                 e
             );
-            assert!(!food_rs::cli::ask_for_continue()?, "user aborted.");
+            if !food_rs::cli::ask_for_continue("with remain tasks")? {
+                bail!("user aborted.");
+            };
         }
     }
 
