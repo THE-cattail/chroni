@@ -8,26 +8,33 @@ use anyhow::{bail, Result};
 use clap::Parser;
 use md5::{Digest, Md5};
 use serde_derive::Deserialize;
+use wildmatch::WildMatch;
 
 #[derive(Deserialize)]
 struct Task {
     src:  PathBuf,
     dest: PathBuf,
 
-    includes: Vec<PathBuf>,
-    excludes: Option<Vec<PathBuf>>,
+    includes: Vec<String>,
+    excludes: Option<Vec<String>>,
+    requires: Option<Vec<String>>,
+
+    only_newest: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
 struct Config {
     tasks: Vec<Task>,
+
+    #[serde(skip_deserializing)]
+    dry_run: bool,
 }
 
 fn main() -> Result<()> {
     let config = initialize()?;
 
     for task in config.tasks {
-        if let Err(e) = process_task(&task) {
+        if let Err(e) = process_task(&task, config.dry_run) {
             println!("process backup task for \"{}\" error: {}",
                      task.src.display(),
                      e);
@@ -60,8 +67,56 @@ fn initialize() -> Result<Config> {
     let config_slice = food_rs::result!(fs::read(&args.config),
                                         "reading \"{}\" error: {}",
                                         args.config.display(),)?;
-    food_rs::result!(food_rs::config::parse(&config_slice),
-                     "parsing config error: {}",)
+    let mut config: Config = food_rs::result!(food_rs::config::parse(&config_slice),
+                                              "parsing config error: {}",)?;
+
+    config.dry_run = args.dry_run;
+
+    Ok(config)
+}
+
+fn process_task(task: &Task, dry_run: bool) -> Result<()> {
+    let (src, dest) = get_src_dest_paths(task)?;
+
+    log::info!("Collecting include files");
+    let mut include_files = Vec::new();
+    food_rs::result!(collect_files(&src,
+                                   Path::new(""),
+                                   &task.includes,
+                                   &task.excludes,
+                                   &task.requires,
+                                   &mut include_files),
+                     "traverse include files of \"{}\" with excludes error: {}",
+                     src.display(),)?;
+
+    log::info!("Collecting exist files of destination directory");
+    let mut dest_exist_files = Vec::new();
+    food_rs::result!(collect_files(&dest,
+                                   Path::new(""),
+                                   &task.includes,
+                                   &None,
+                                   &None,
+                                   &mut dest_exist_files),
+                     "traverse exist files of destination directory \"{}\" error: {}",
+                     dest.display(),)?;
+
+    log::info!("Generating to-do list");
+    let (add_list, overwrite_list, remove_list) =
+        generate_to_do_list(&src, &dest, &include_files, &dest_exist_files)?;
+
+    if dry_run {
+        println!("chroni: Dry-run task for {} done.", src.display());
+
+        return Ok(());
+    }
+
+    execute_list("remove", &remove_list, remove, &src, &dest);
+    execute_list("overwrite", &overwrite_list, overwrite, &src, &dest);
+    execute_list("add", &add_list, add, &src, &dest);
+
+    println!("chroni: Task for {} done.", src.display());
+
+    Ok(())
 }
 
 fn get_src_dest_paths(task: &Task) -> Result<(PathBuf, PathBuf)> {
@@ -85,40 +140,27 @@ fn get_src_dest_paths(task: &Task) -> Result<(PathBuf, PathBuf)> {
                          task.dest.display(),)?))
 }
 
-fn process_task(task: &Task) -> Result<()> {
-    let (src, dest) = get_src_dest_paths(task)?;
-
-    log::info!("Collecting include files");
-    let include_files = collect_include_files(&src, &task.includes, &task.excludes)?;
-
-    log::info!("Collecting exist files of destination directory");
-    let dest_exist_files = collect_dest_exist_files(&dest)?;
-
-    log::info!("Generating to-do list");
-    let (add_list, overwrite_list, remove_list) =
-        generate_to_do_list(&src, &dest, &include_files, &dest_exist_files)?;
-
-    execute_list("remove", &remove_list, remove, &src, &dest);
-    execute_list("overwrite", &overwrite_list, overwrite, &src, &dest);
-    execute_list("add", &add_list, add, &src, &dest);
-
-    println!("chroni: Task for {} done.", src.display());
-
-    Ok(())
-}
-
 fn collect_files(prefix: &Path,
                  entry: &Path,
-                 set: &mut Vec<PathBuf>,
-                 exclude: &Option<Vec<PathBuf>>)
+                 includes: &[String],
+                 excludes: &Option<Vec<String>>,
+                 requires: &Option<Vec<String>>,
+                 set: &mut Vec<PathBuf>)
                  -> Result<()> {
+    if !matches(entry, includes) {
+        return Ok(());
+    }
+
     let path = prefix.join(entry);
     let path_str = path.display();
     log::debug!("Traversing: \"{path_str}\"");
 
-    if let Some(exclude) = exclude {
-        for exclude_entry in exclude {
-            if entry.starts_with(exclude_entry) {
+    let require = requires.as_ref()
+                          .map_or(false, |requires| matches(entry, requires));
+
+    if !require {
+        if let Some(excludes) = excludes {
+            if matches(entry, excludes) {
                 log::debug!("  ~ Skiped: \"{path_str}\"");
                 return Ok(());
             }
@@ -127,7 +169,12 @@ fn collect_files(prefix: &Path,
 
     if path.is_dir() {
         for entry in fs::read_dir(path)? {
-            collect_files(prefix, entry?.path().strip_prefix(prefix)?, set, exclude)?;
+            collect_files(prefix,
+                          entry?.path().strip_prefix(prefix)?,
+                          includes,
+                          excludes,
+                          requires,
+                          set)?;
         }
     }
 
@@ -141,25 +188,14 @@ fn collect_files(prefix: &Path,
     Ok(())
 }
 
-fn collect_include_files(src: &Path,
-                         includes: &Vec<PathBuf>,
-                         excludes: &Option<Vec<PathBuf>>)
-                         -> Result<Vec<PathBuf>> {
-    let mut include_set = Vec::new();
-    for entry in includes {
-        food_rs::result!(collect_files(src, entry, &mut include_set, excludes),
-                         "traverse include files of \"{}\" with excludes error: {}",
-                         src.join(entry).display(),)?;
+fn matches(entry: &Path, patterns: &[String]) -> bool {
+    for p in patterns {
+        if WildMatch::new(p).matches(&entry.display().to_string()) {
+            return true;
+        };
     }
-    Ok(include_set)
-}
 
-fn collect_dest_exist_files(dest: &Path) -> Result<Vec<PathBuf>> {
-    let mut dest_exist_set = Vec::new();
-    food_rs::result!(collect_files(dest, Path::new(""), &mut dest_exist_set, &None),
-                     "traverse exist files of destination directory \"{}\" error: {}",
-                     dest.display(),)?;
-    Ok(dest_exist_set)
+    false
 }
 
 fn generate_to_do_list(src: &Path,

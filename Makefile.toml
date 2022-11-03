@@ -1,0 +1,8 @@
+[tasks.install]
+command = "sudo"
+args = [
+    "cp",
+    "target/release/${CARGO_MAKE_CRATE_FS_NAME}",
+    "/usr/bin"
+]
+dependencies = ["build-release"]
