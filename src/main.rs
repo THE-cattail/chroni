@@ -153,14 +153,14 @@ fn collect_files(prefix: &Path,
     let path = prefix.join(entry);
     let path_str = path.display();
 
-    log::debug!("Traversing: \"{path_str}\"");
+    log::trace!("collect_files({path_str})");
 
     if !requires.as_ref()
                 .map_or(false, |requires| matches(entry, requires))
     {
         if let Some(excludes) = excludes {
             if matches(entry, excludes) {
-                log::debug!("  ~ Skiped: \"{path_str}\"");
+                log::trace!("matches(excludes: {path_str})");
                 return Ok(());
             }
         }
@@ -180,7 +180,7 @@ fn collect_files(prefix: &Path,
     }
 
     if include {
-        log::debug!("  > Collecting: \"{}\"", entry.display());
+        log::trace!("set.push({})", entry.display());
         set.push(entry.to_owned());
     }
 
@@ -189,6 +189,9 @@ fn collect_files(prefix: &Path,
 
 fn matches(entry: &Path, patterns: &[String]) -> bool {
     for p in patterns {
+        if p == "." && entry == Path::new("") {
+            return true;
+        }
         if WildMatch::new(p).matches(&entry.display().to_string()) {
             return true;
         };

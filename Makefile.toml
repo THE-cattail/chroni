@@ -6,3 +6,12 @@ args = [
     "/usr/bin"
 ]
 dependencies = ["build-release"]
+
+[tasks.debug]
+command = "sudo"
+args = [
+    "cp",
+    "target/debug/${CARGO_MAKE_CRATE_FS_NAME}",
+    "/usr/bin"
+]
+dependencies = ["build"]
