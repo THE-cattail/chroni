@@ -139,6 +139,10 @@ fn get_src_dest_paths(task: &Task) -> Result<(PathBuf, PathBuf)> {
                          task.dest.display(),)?))
 }
 
+lazy_static::lazy_static! {
+    static ref ANY_PATTERN: Vec<String> = vec!["*".to_owned()];
+}
+
 fn collect_files(prefix: &Path,
                  entry: &Path,
                  includes: &[String],
@@ -162,18 +166,20 @@ fn collect_files(prefix: &Path,
         }
     }
 
+    let include = matches(entry, includes);
+
     if path.is_dir() {
         for entry in fs::read_dir(&path)? {
             collect_files(prefix,
                           entry?.path().strip_prefix(prefix)?,
-                          includes,
+                          if include { &ANY_PATTERN } else { includes },
                           excludes,
                           requires,
                           set)?;
         }
     }
 
-    if matches(entry, includes) {
+    if include {
         log::debug!("  > Collecting: \"{}\"", entry.display());
         set.push(entry.to_owned());
     }
