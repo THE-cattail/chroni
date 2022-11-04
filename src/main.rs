@@ -1,5 +1,6 @@
 use std::{
-    fs,
+    fs::{self, File},
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -253,7 +254,20 @@ fn file_same(src: &Path, dest: &Path) -> Result<bool> {
         return Ok(false);
     }
 
-    Ok(file_diff::diff(&src_str.to_string(), &dest_str.to_string()))
+    let src_file = food_rs::result!(File::open(src), "open source file \"{src_str}\" error: {}",)?;
+    let dest_file = food_rs::result!(File::open(src),
+                                     "open destination file \"{dest_str}\" error: {}",)?;
+
+    for (src_byte, dest_byte) in src_file.bytes().zip(dest_file.bytes()) {
+        if food_rs::result!(src_byte, "read byte of source file \"{src_str}\" error: {}",)?
+           != food_rs::result!(dest_byte,
+                               "read byte of destination file \"{dest_str}\" error: {}",)?
+        {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
 }
 
 fn execute_list(name: &str,
