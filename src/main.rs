@@ -147,18 +147,14 @@ fn collect_files(prefix: &Path,
                  requires: &Option<Vec<String>>,
                  set: &mut Vec<PathBuf>)
                  -> Result<()> {
-    if !matches(entry, includes) {
-        return Ok(());
-    }
-
     let path = prefix.join(entry);
     let path_str = path.display();
+
     log::debug!("Traversing: \"{path_str}\"");
 
-    let require = requires.as_ref()
-                          .map_or(false, |requires| matches(entry, requires));
-
-    if !require {
+    if !requires.as_ref()
+                .map_or(false, |requires| matches(entry, requires))
+    {
         if let Some(excludes) = excludes {
             if matches(entry, excludes) {
                 log::debug!("  ~ Skiped: \"{path_str}\"");
@@ -168,7 +164,7 @@ fn collect_files(prefix: &Path,
     }
 
     if path.is_dir() {
-        for entry in fs::read_dir(path)? {
+        for entry in fs::read_dir(&path)? {
             collect_files(prefix,
                           entry?.path().strip_prefix(prefix)?,
                           includes,
@@ -178,12 +174,10 @@ fn collect_files(prefix: &Path,
         }
     }
 
-    if entry == Path::new("") {
-        return Ok(());
+    if matches(entry, includes) {
+        log::debug!("  > Collecting: \"{}\"", entry.display());
+        set.push(entry.to_owned());
     }
-
-    log::debug!("  > Collecting: \"{}\"", entry.display());
-    set.push(entry.to_owned());
 
     Ok(())
 }
@@ -292,7 +286,7 @@ fn execute_list(name: &str,
                 log::warn!("{e}");
             };
             log::info!("[ {}% ] | [{}] {}",
-                       i * 100 / list_len,
+                       (i + 1) * 100 / list_len,
                        name.to_uppercase(),
                        entry.display());
         }
