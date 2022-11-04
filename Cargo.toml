@@ -15,9 +15,9 @@ categories = ["command-line-utilities", "filesystem"]
 anyhow = "1.0"
 clap = { version = "4.0", features = ["cargo", "derive"] }
 env_logger = "0.9"
+file_diff = "1.0"
 food-rs = { version = "0.1.0", path = "../food-rs" }
 log = "0.4"
-md-5 = "0.10"
 serde = "1.0"
 serde_derive = "1.0"
 toml = "0.4"
