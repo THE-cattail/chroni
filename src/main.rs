@@ -1,12 +1,13 @@
 use std::{
     fs::{self, File},
-    io::Read,
+    io,
     path::{Path, PathBuf},
 };
 
 use anyhow::{bail, Result};
 use clap::Parser;
 use serde_derive::Deserialize;
+use sha1::{Digest, Sha1};
 use wildmatch::WildMatch;
 
 #[derive(Deserialize)]
@@ -263,20 +264,22 @@ fn file_same(src: &Path, dest: &Path) -> Result<bool> {
         return Ok(false);
     }
 
-    let src_file = food_rs::result!(File::open(src), "open source file \"{src_str}\" error: {}",)?;
-    let dest_file = food_rs::result!(File::open(src),
-                                     "open destination file \"{dest_str}\" error: {}",)?;
+    let mut src_file = food_rs::result!(File::open(src),
+                                        "open source file \"{}\" error: {}",
+                                        src_str,)?;
+    let mut src_hasher = Sha1::new();
+    food_rs::result!(io::copy(&mut src_file, &mut src_hasher),
+                     "copy source file \"{src_str}\" to hasher error: {}",)?;
+    let src_hash = src_hasher.finalize();
 
-    for (src_byte, dest_byte) in src_file.bytes().zip(dest_file.bytes()) {
-        if food_rs::result!(src_byte, "read byte of source file \"{src_str}\" error: {}",)?
-           != food_rs::result!(dest_byte,
-                               "read byte of destination file \"{dest_str}\" error: {}",)?
-        {
-            return Ok(false);
-        }
-    }
+    let mut dest_file = food_rs::result!(File::open(dest),
+                                         "open destination file \"{dest_str}\" error: {}",)?;
+    let mut dest_hasher = Sha1::new();
+    food_rs::result!(io::copy(&mut dest_file, &mut dest_hasher),
+                     "copy destination file \"{dest_str}\" to hasher error: {}",)?;
+    let dest_hash = dest_hasher.finalize();
 
-    Ok(true)
+    Ok(src_hash == dest_hash)
 }
 
 fn execute_list(name: &str,
