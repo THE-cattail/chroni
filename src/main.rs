@@ -2,6 +2,7 @@ use std::{
     fs::{self, File},
     io,
     path::{Path, PathBuf},
+    time::SystemTime,
 };
 
 use anyhow::{bail, Result};
@@ -10,10 +11,31 @@ use serde_derive::Deserialize;
 use sha1::{Digest, Sha1};
 use wildmatch::WildMatch;
 
+#[derive(PartialEq)]
+#[derive(Deserialize)]
+#[derive(Default)]
+enum OverwriteMode {
+    #[serde(rename = "any")]
+    Any,
+
+    #[serde(rename = "deep_compare")]
+    DeepCompare,
+
+    #[default]
+    #[serde(rename = "fast_compare")]
+    FastCompare,
+
+    #[serde(rename = "never")]
+    Never,
+}
+
 #[derive(Deserialize)]
 struct Task {
     src:  PathBuf,
     dest: PathBuf,
+
+    #[serde(default = "OverwriteMode::default")]
+    overwrite_mode: OverwriteMode,
 
     includes: Vec<String>,
     excludes: Option<Vec<String>>,
@@ -54,7 +76,9 @@ struct CliArgs {
     #[arg(short, long, value_name = "FILE", help = "Specify configuration file",
     value_hint = clap::ValueHint::FilePath, default_value = "config")]
     config:  PathBuf,
-    #[arg(long = "dry-run", default_value = "false")]
+    #[arg(long = "dry-run",
+          help = "Run without actual file operations",
+          default_value = "false")]
     dry_run: bool,
 }
 
@@ -83,8 +107,7 @@ fn process_task(task: &Task, dry_run: bool) -> Result<()> {
     food_rs::result!(collect_files(&src,
                                    Path::new(""),
                                    &task.includes,
-                                   &task.excludes,
-                                   &task.requires,
+                                   task,
                                    &mut include_files),
                      "traverse include files of \"{}\" with excludes error: {}",
                      src.display(),)?;
@@ -94,15 +117,17 @@ fn process_task(task: &Task, dry_run: bool) -> Result<()> {
     food_rs::result!(collect_files(&dest,
                                    Path::new(""),
                                    &task.includes,
-                                   &None,
-                                   &None,
+                                   task,
                                    &mut dest_exist_files),
                      "traverse exist files of destination directory \"{}\" error: {}",
                      dest.display(),)?;
 
     log::info!("Generating to-do list");
-    let (add_list, overwrite_list, remove_list) =
-        generate_to_do_list(&src, &dest, &include_files, &dest_exist_files)?;
+    let (add_list, overwrite_list, remove_list) = generate_to_do_list(&src,
+                                                                      &dest,
+                                                                      &include_files,
+                                                                      &dest_exist_files,
+                                                                      &task.overwrite_mode)?;
 
     if dry_run {
         println!("chroni: Dry-run task for {} done.", src.display());
@@ -144,11 +169,15 @@ lazy_static::lazy_static! {
     static ref ANY_PATTERN: Vec<String> = vec!["*".to_owned()];
 }
 
+struct Newest {
+    entry:   PathBuf,
+    created: SystemTime,
+}
+
 fn collect_files(prefix: &Path,
                  entry: &Path,
                  includes: &[String],
-                 excludes: &Option<Vec<String>>,
-                 requires: &Option<Vec<String>>,
+                 task: &Task,
                  set: &mut Vec<PathBuf>)
                  -> Result<()> {
     let path = prefix.join(entry);
@@ -156,10 +185,11 @@ fn collect_files(prefix: &Path,
 
     log::trace!("collect_files({path_str})");
 
-    if !requires.as_ref()
-                .map_or(false, |requires| matches(entry, requires))
+    if !task.requires
+            .as_ref()
+            .map_or(false, |requires| matches(entry, requires))
     {
-        if let Some(excludes) = excludes {
+        if let Some(excludes) = &task.excludes {
             if matches(entry, excludes) {
                 log::trace!("matches(excludes: {path_str})");
                 return Ok(());
@@ -170,13 +200,57 @@ fn collect_files(prefix: &Path,
     let include = matches(entry, includes);
 
     if path.is_dir() {
-        for entry in fs::read_dir(&path)? {
-            collect_files(prefix,
-                          entry?.path().strip_prefix(prefix)?,
-                          if include { &ANY_PATTERN } else { includes },
-                          excludes,
-                          requires,
-                          set)?;
+        let mut collect_newest = false;
+        if let Some(only_newest) = &task.only_newest {
+            if matches(entry, only_newest) {
+                collect_newest = true;
+
+                if food_rs::result!(path.metadata(),
+                                    "get metadata of file \"{}\" error: {}",
+                                    path_str,)?.created()
+                                               .is_ok()
+                {
+                    let mut newest: Option<Newest> = None;
+                    for entry in fs::read_dir(&path)? {
+                        let path = entry?.path();
+                        let created = food_rs::result!(path.metadata(),
+                                                       "get metadata of file \"{}\" error: {}",
+                                                       path.display(),)?.created()?;
+
+                        if newest.as_ref()
+                                 .map_or(true, |newest| created > newest.created)
+                        {
+                            newest = Some(Newest { entry: path.strip_prefix(prefix)?
+                                                              .to_path_buf(),
+                                                   created });
+                        }
+                    }
+
+                    if let Some(newest) = newest {
+                        collect_files(prefix,
+                                      &newest.entry,
+                                      if include { &ANY_PATTERN } else { includes },
+                                      task,
+                                      set)?;
+                    }
+                } else if let Some(entry) = fs::read_dir(&path)?.last() {
+                    collect_files(prefix,
+                                  entry?.path().strip_prefix(prefix)?,
+                                  if include { &ANY_PATTERN } else { includes },
+                                  task,
+                                  set)?;
+                }
+            }
+        }
+
+        if !collect_newest {
+            for entry in fs::read_dir(&path)? {
+                collect_files(prefix,
+                              entry?.path().strip_prefix(prefix)?,
+                              if include { &ANY_PATTERN } else { includes },
+                              task,
+                              set)?;
+            }
         }
     }
 
@@ -204,7 +278,8 @@ fn matches(entry: &Path, patterns: &[String]) -> bool {
 fn generate_to_do_list(src: &Path,
                        dest: &Path,
                        include_files: &[PathBuf],
-                       dest_exist_files: &[PathBuf])
+                       dest_exist_files: &[PathBuf],
+                       overwrite_mode: &OverwriteMode)
                        -> Result<(Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>)> {
     let mut add_list = Vec::new();
     let mut overwrite_list = Vec::new();
@@ -230,7 +305,7 @@ fn generate_to_do_list(src: &Path,
         let dest_str = dest.display();
 
         log::debug!("? Comparing: \"{src_str}\" & \"{dest_str}\"");
-        if food_rs::result!(file_same(&src, &dest),
+        if food_rs::result!(need_overwrite(&src, &dest, overwrite_mode),
                             "compare file \"{src_str}\" with \"{dest_str}\" error: {}",)?
         {
             log::debug!("  ~ Skiped: {entry_str}");
@@ -250,18 +325,27 @@ fn generate_to_do_list(src: &Path,
     Ok((add_list, overwrite_list, remove_list))
 }
 
-fn file_same(src: &Path, dest: &Path) -> Result<bool> {
+fn need_overwrite(src: &Path, dest: &Path, mode: &OverwriteMode) -> Result<bool> {
+    if mode == &OverwriteMode::Any {
+        return Ok(false);
+    }
+    if mode == &OverwriteMode::Never {
+        return Ok(true);
+    }
+
     let src_str = src.display();
     let dest_str = dest.display();
 
-    let src_metadata = food_rs::result!(src.metadata(),
-                                        "get metadata of source file \"{src_str}\" error: {}",)?;
-    let dest_metadata = food_rs::result!(dest.metadata(),
-                                         "get metadata of destination file \"{dest_str}\" \
-                                          error: {}",)?;
-
-    if src_metadata.len() != dest_metadata.len() {
+    if food_rs::result!(src.metadata(),
+                        "get metadata of source file \"{src_str}\" error: {}",)?.len()
+       != food_rs::result!(dest.metadata(),
+                           "get metadata of destination file \"{dest_str}\" error: {}",)?.len()
+    {
         return Ok(false);
+    }
+
+    if mode == &OverwriteMode::FastCompare {
+        return Ok(true);
     }
 
     let mut src_file = food_rs::result!(File::open(src),

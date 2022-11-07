@@ -7,7 +7,7 @@ Usage: chroni [OPTIONS]
 
 Options:
   -c, --config <FILE>  Specify configuration file [default: config]
-      --dry-run        
+      --dry-run        Run without actual file operations
   -h, --help           Print help information
   -V, --version        Print version information
 ```
