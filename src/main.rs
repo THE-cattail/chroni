@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     fs::{self, File},
     io,
     path::{Path, PathBuf},
@@ -57,9 +58,7 @@ fn main() -> Result<()> {
 
     for task in config.tasks {
         if let Err(e) = process_task(&task, config.dry_run) {
-            println!("process backup task for \"{}\" error: {}",
-                     task.src.display(),
-                     e);
+            println!("{e}");
             if !food_rs::cli::ask_for_continue("with remain tasks")? {
                 bail!("user aborted.");
             };
@@ -76,9 +75,11 @@ struct CliArgs {
     #[arg(short, long, value_name = "FILE", help = "Specify configuration file",
     value_hint = clap::ValueHint::FilePath, default_value = "config")]
     config:  PathBuf,
-    #[arg(long = "dry-run",
-          help = "Run without actual file operations",
-          default_value = "false")]
+    #[arg(
+        long = "dry-run",
+        help = "Run without actual file operations",
+        default_value = "false"
+    )]
     dry_run: bool,
 }
 
@@ -88,11 +89,15 @@ fn initialize() -> Result<Config> {
     let args = CliArgs::parse();
 
     log::info!("Reading \"{}\"", args.config.display());
-    let config_slice = food_rs::result!(fs::read(&args.config),
-                                        "reading \"{}\" error: {}",
-                                        args.config.display(),)?;
-    let mut config: Config = food_rs::result!(food_rs::config::parse(&config_slice),
-                                              "parsing config error: {}",)?;
+    let config_slice = food_rs::result!(
+        fs::read(&args.config),
+        "reading \"{}\" error: {}",
+        args.config.display(),
+    )?;
+    let mut config: Config = food_rs::result!(
+        food_rs::config::parse(&config_slice),
+        "parsing config error: {}",
+    )?;
 
     config.dry_run = args.dry_run;
 
@@ -104,30 +109,37 @@ fn process_task(task: &Task, dry_run: bool) -> Result<()> {
 
     log::info!("Collecting include files");
     let mut include_files = Vec::new();
-    food_rs::result!(collect_files(&src,
-                                   Path::new(""),
-                                   &task.includes,
-                                   task,
-                                   &mut include_files),
-                     "traverse include files of \"{}\" with excludes error: {}",
-                     src.display(),)?;
+    collect_files(
+        &src,
+        Path::new(""),
+        &task.includes,
+        task,
+        &mut include_files,
+    )?;
+
+    if let Some(only_newest) = &task.only_newest {
+        log::info!("Progressing only-newest lists");
+        keep_only_newest(&src, &mut include_files, only_newest)?;
+    }
 
     log::info!("Collecting exist files of destination directory");
     let mut dest_exist_files = Vec::new();
-    food_rs::result!(collect_files(&dest,
-                                   Path::new(""),
-                                   &task.includes,
-                                   task,
-                                   &mut dest_exist_files),
-                     "traverse exist files of destination directory \"{}\" error: {}",
-                     dest.display(),)?;
+    collect_files(
+        &dest,
+        Path::new(""),
+        &task.includes,
+        task,
+        &mut dest_exist_files,
+    )?;
 
     log::info!("Generating to-do list");
-    let (add_list, overwrite_list, remove_list) = generate_to_do_list(&src,
-                                                                      &dest,
-                                                                      &include_files,
-                                                                      &dest_exist_files,
-                                                                      &task.overwrite_mode)?;
+    let (add_list, overwrite_list, remove_list) = generate_to_do_list(
+        &src,
+        &dest,
+        &include_files,
+        &dest_exist_files,
+        &task.overwrite_mode,
+    )?;
 
     if dry_run {
         println!("chroni: Dry-run task for {} done.", src.display());
@@ -147,110 +159,86 @@ fn process_task(task: &Task, dry_run: bool) -> Result<()> {
 fn get_src_dest_paths(task: &Task) -> Result<(PathBuf, PathBuf)> {
     log::info!("Checking source path \"{}\"", task.src.display());
     if !task.src.is_dir() {
-        anyhow::bail!("check source path \"{}\" error: not a directory",
-                      task.src.display());
+        anyhow::bail!(
+            "check source path \"{}\" error: not a directory",
+            task.src.display()
+        );
     }
 
     log::info!("Creating destination path \"{}\"", task.dest.display());
-    food_rs::result!(fs::create_dir_all(&task.dest),
-                     "create destination path \"{}\" error: {}",
-                     task.dest.display(),)?;
+    food_rs::result!(
+        fs::create_dir_all(&task.dest),
+        "create destination path \"{}\" error: {}",
+        task.dest.display(),
+    )?;
 
     log::info!("Getting absolute path of source and destination directory");
-    Ok((food_rs::result!(fs::canonicalize(&task.src),
-                         "get absolute path of source path \"{}\" error: {}",
-                         task.src.display(),)?,
-        food_rs::result!(fs::canonicalize(&task.dest),
-                         "get absolute path of destination path \"{}\" error: {}",
-                         task.dest.display(),)?))
+    Ok((
+        food_rs::result!(
+            fs::canonicalize(&task.src),
+            "get absolute path of source path \"{}\" error: {}",
+            task.src.display(),
+        )?,
+        food_rs::result!(
+            fs::canonicalize(&task.dest),
+            "get absolute path of destination path \"{}\" error: {}",
+            task.dest.display(),
+        )?,
+    ))
+}
+
+fn matches(entry: &Path, patterns: &[String]) -> Option<String> {
+    for p in patterns {
+        if (p == "." && entry == Path::new(""))
+            || WildMatch::new(p).matches(&entry.display().to_string())
+        {
+            return Some(p.clone());
+        };
+    }
+
+    None
 }
 
 lazy_static::lazy_static! {
     static ref ANY_PATTERN: Vec<String> = vec!["*".to_owned()];
 }
 
-struct Newest {
-    entry:   PathBuf,
-    created: SystemTime,
-}
-
-fn collect_files(prefix: &Path,
-                 entry: &Path,
-                 includes: &[String],
-                 task: &Task,
-                 set: &mut Vec<PathBuf>)
-                 -> Result<()> {
+fn collect_files(
+    prefix: &Path,
+    entry: &Path,
+    includes: &[String],
+    task: &Task,
+    set: &mut Vec<PathBuf>,
+) -> Result<()> {
     let path = prefix.join(entry);
     let path_str = path.display();
 
     log::trace!("collect_files({path_str})");
 
-    if !task.requires
-            .as_ref()
-            .map_or(false, |requires| matches(entry, requires))
+    if !task
+        .requires
+        .as_ref()
+        .map_or(false, |requires| matches(entry, requires).is_some())
     {
         if let Some(excludes) = &task.excludes {
-            if matches(entry, excludes) {
+            if matches(entry, excludes).is_some() {
                 log::trace!("matches(excludes: {path_str})");
                 return Ok(());
             }
         }
     }
 
-    let include = matches(entry, includes);
+    let include = matches(entry, includes).is_some();
 
     if path.is_dir() {
-        let mut collect_newest = false;
-        if let Some(only_newest) = &task.only_newest {
-            if matches(entry, only_newest) {
-                collect_newest = true;
-
-                if food_rs::result!(path.metadata(),
-                                    "get metadata of file \"{}\" error: {}",
-                                    path_str,)?.created()
-                                               .is_ok()
-                {
-                    let mut newest: Option<Newest> = None;
-                    for entry in fs::read_dir(&path)? {
-                        let path = entry?.path();
-                        let created = food_rs::result!(path.metadata(),
-                                                       "get metadata of file \"{}\" error: {}",
-                                                       path.display(),)?.created()?;
-
-                        if newest.as_ref()
-                                 .map_or(true, |newest| created > newest.created)
-                        {
-                            newest = Some(Newest { entry: path.strip_prefix(prefix)?
-                                                              .to_path_buf(),
-                                                   created });
-                        }
-                    }
-
-                    if let Some(newest) = newest {
-                        collect_files(prefix,
-                                      &newest.entry,
-                                      if include { &ANY_PATTERN } else { includes },
-                                      task,
-                                      set)?;
-                    }
-                } else if let Some(entry) = fs::read_dir(&path)?.last() {
-                    collect_files(prefix,
-                                  entry?.path().strip_prefix(prefix)?,
-                                  if include { &ANY_PATTERN } else { includes },
-                                  task,
-                                  set)?;
-                }
-            }
-        }
-
-        if !collect_newest {
-            for entry in fs::read_dir(&path)? {
-                collect_files(prefix,
-                              entry?.path().strip_prefix(prefix)?,
-                              if include { &ANY_PATTERN } else { includes },
-                              task,
-                              set)?;
-            }
+        for entry in fs::read_dir(&path)? {
+            collect_files(
+                prefix,
+                entry?.path().strip_prefix(prefix)?,
+                if include { &ANY_PATTERN } else { includes },
+                task,
+                set,
+            )?;
         }
     }
 
@@ -261,26 +249,57 @@ fn collect_files(prefix: &Path,
 
     Ok(())
 }
-
-fn matches(entry: &Path, patterns: &[String]) -> bool {
-    for p in patterns {
-        if p == "." && entry == Path::new("") {
-            return true;
-        }
-        if WildMatch::new(p).matches(&entry.display().to_string()) {
-            return true;
-        };
-    }
-
-    false
+struct Newest {
+    entry:   PathBuf,
+    created: SystemTime,
 }
 
-fn generate_to_do_list(src: &Path,
-                       dest: &Path,
-                       include_files: &[PathBuf],
-                       dest_exist_files: &[PathBuf],
-                       overwrite_mode: &OverwriteMode)
-                       -> Result<(Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>)> {
+fn keep_only_newest(
+    src: &Path,
+    include_files: &mut Vec<PathBuf>,
+    only_newest: &[String],
+) -> Result<()> {
+    let mut m: HashMap<String, Newest> = HashMap::new();
+    let mut to_removes = HashSet::new();
+
+    for entry in &*include_files {
+        if let Some(pattern) = matches(entry, only_newest) {
+            let created = src.join(entry).metadata()?.created()?;
+
+            let insert = m.get(&pattern).map_or(true, |newest| {
+                if created > newest.created {
+                    to_removes.insert(newest.entry.clone());
+                    true
+                } else {
+                    to_removes.insert(entry.clone());
+                    false
+                }
+            });
+
+            if insert {
+                m.insert(
+                    pattern,
+                    Newest {
+                        entry: entry.clone(),
+                        created,
+                    },
+                );
+            }
+        }
+    }
+
+    include_files.retain(|e| !to_removes.contains(e));
+
+    Ok(())
+}
+
+fn generate_to_do_list(
+    src: &Path,
+    dest: &Path,
+    include_files: &[PathBuf],
+    dest_exist_files: &[PathBuf],
+    overwrite_mode: &OverwriteMode,
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>)> {
     let mut add_list = Vec::new();
     let mut overwrite_list = Vec::new();
     let mut remove_list = Vec::new();
@@ -305,9 +324,7 @@ fn generate_to_do_list(src: &Path,
         let dest_str = dest.display();
 
         log::debug!("? Comparing: \"{src_str}\" & \"{dest_str}\"");
-        if food_rs::result!(need_overwrite(&src, &dest, overwrite_mode),
-                            "compare file \"{src_str}\" with \"{dest_str}\" error: {}",)?
-        {
+        if need_overwrite(&src, &dest, overwrite_mode)? {
             log::debug!("  ~ Skiped: {entry_str}");
         } else {
             log::debug!("  ^ To overwrite: {entry_str}");
@@ -336,10 +353,16 @@ fn need_overwrite(src: &Path, dest: &Path, mode: &OverwriteMode) -> Result<bool>
     let src_str = src.display();
     let dest_str = dest.display();
 
-    if food_rs::result!(src.metadata(),
-                        "get metadata of source file \"{src_str}\" error: {}",)?.len()
-       != food_rs::result!(dest.metadata(),
-                           "get metadata of destination file \"{dest_str}\" error: {}",)?.len()
+    if food_rs::result!(
+        src.metadata(),
+        "get metadata of source file \"{src_str}\" error: {}",
+    )?
+    .len()
+        != food_rs::result!(
+            dest.metadata(),
+            "get metadata of destination file \"{dest_str}\" error: {}",
+        )?
+        .len()
     {
         return Ok(false);
     }
@@ -348,29 +371,39 @@ fn need_overwrite(src: &Path, dest: &Path, mode: &OverwriteMode) -> Result<bool>
         return Ok(true);
     }
 
-    let mut src_file = food_rs::result!(File::open(src),
-                                        "open source file \"{}\" error: {}",
-                                        src_str,)?;
+    let mut src_file = food_rs::result!(
+        File::open(src),
+        "open source file \"{}\" error: {}",
+        src_str,
+    )?;
     let mut src_hasher = Sha1::new();
-    food_rs::result!(io::copy(&mut src_file, &mut src_hasher),
-                     "copy source file \"{src_str}\" to hasher error: {}",)?;
+    food_rs::result!(
+        io::copy(&mut src_file, &mut src_hasher),
+        "copy source file \"{src_str}\" to hasher error: {}",
+    )?;
     let src_hash = src_hasher.finalize();
 
-    let mut dest_file = food_rs::result!(File::open(dest),
-                                         "open destination file \"{dest_str}\" error: {}",)?;
+    let mut dest_file = food_rs::result!(
+        File::open(dest),
+        "open destination file \"{dest_str}\" error: {}",
+    )?;
     let mut dest_hasher = Sha1::new();
-    food_rs::result!(io::copy(&mut dest_file, &mut dest_hasher),
-                     "copy destination file \"{dest_str}\" to hasher error: {}",)?;
+    food_rs::result!(
+        io::copy(&mut dest_file, &mut dest_hasher),
+        "copy destination file \"{dest_str}\" to hasher error: {}",
+    )?;
     let dest_hash = dest_hasher.finalize();
 
     Ok(src_hash == dest_hash)
 }
 
-fn execute_list(name: &str,
-                list: &[PathBuf],
-                f: fn(&Path, &Path, &Path) -> Result<()>,
-                src: &Path,
-                dest: &Path) {
+fn execute_list(
+    name: &str,
+    list: &[PathBuf],
+    f: fn(&Path, &Path, &Path) -> Result<()>,
+    src: &Path,
+    dest: &Path,
+) {
     if !list.is_empty() {
         let list_len = list.len();
         log::info!("Execute {name} list");
@@ -378,10 +411,12 @@ fn execute_list(name: &str,
             if let Err(e) = (f)(src, dest, entry) {
                 log::warn!("{e}");
             };
-            log::info!("[ {}% ] | [{}] {}",
-                       (i + 1) * 100 / list_len,
-                       name.to_uppercase(),
-                       entry.display());
+            log::info!(
+                "[ {}% ] | [{}] {}",
+                (i + 1) * 100 / list_len,
+                name.to_uppercase(),
+                entry.display()
+            );
         }
     }
 }
@@ -392,14 +427,16 @@ fn remove(_: &Path, dest: &Path, entry: &Path) -> Result<()> {
 
     log::debug!("* - Removing: {path_str}");
 
-    food_rs::result!(if path.is_dir() {
-                         log::trace!("remove dir");
-                         fs::remove_dir(&path)
-                     } else {
-                         log::trace!("remove file");
-                         fs::remove_file(&path)
-                     },
-                     "remove \"{path_str}\" error: {}",)?;
+    food_rs::result!(
+        if path.is_dir() {
+            log::trace!("remove dir");
+            fs::remove_dir(&path)
+        } else {
+            log::trace!("remove file");
+            fs::remove_file(&path)
+        },
+        "remove \"{path_str}\" error: {}",
+    )?;
 
     Ok(())
 }
@@ -431,20 +468,28 @@ fn overwrite(src: &Path, dest: &Path, entry: &Path) -> Result<()> {
     log::debug!("* ^ Overwriting: {src_str} -> {dest_str}");
 
     log::trace!("copy({src_str}, {dest_new_tmp_str})");
-    food_rs::result!(fs::copy(&src, &dest_new_tmp),
-                     "copy \"{src_str}\" for overwriting \"{dest_str}\" error: {}",)?;
+    food_rs::result!(
+        fs::copy(&src, &dest_new_tmp),
+        "copy \"{src_str}\" for overwriting \"{dest_str}\" error: {}",
+    )?;
 
     log::trace!("rename({dest_str}, {dest_old_tmp_str})");
-    food_rs::result!(fs::rename(&dest, &dest_old_tmp),
-                     "rename \"{dest_str}\" for overwriting \"{dest_str}\" error: {}",)?;
+    food_rs::result!(
+        fs::rename(&dest, &dest_old_tmp),
+        "rename \"{dest_str}\" for overwriting \"{dest_str}\" error: {}",
+    )?;
 
     log::trace!("rename({dest_new_tmp_str}, {dest_str})");
-    food_rs::result!(fs::rename(&dest_new_tmp, &dest),
-                     "rename \"{dest_new_tmp_str}\" for overwriting \"{dest_str}\" error: {}",)?;
+    food_rs::result!(
+        fs::rename(&dest_new_tmp, &dest),
+        "rename \"{dest_new_tmp_str}\" for overwriting \"{dest_str}\" error: {}",
+    )?;
 
     log::trace!("remove({dest_old_tmp_str})");
-    food_rs::result!(fs::remove_file(&dest_old_tmp),
-                     "remove \"{dest_old_tmp_str}\" for overwriting \"{dest_str}\" error: {}",)?;
+    food_rs::result!(
+        fs::remove_file(&dest_old_tmp),
+        "remove \"{dest_old_tmp_str}\" for overwriting \"{dest_str}\" error: {}",
+    )?;
 
     Ok(())
 }
@@ -460,10 +505,12 @@ fn add(src: &Path, dest: &Path, entry: &Path) -> Result<()> {
 
     if let Some(parent) = dest.parent() {
         log::trace!("create dir all");
-        food_rs::result!(fs::create_dir_all(parent),
-                         "create directory \"{}\" for adding \"{}\" error: {}",
-                         parent.display(),
-                         entry.display(),)?;
+        food_rs::result!(
+            fs::create_dir_all(parent),
+            "create directory \"{}\" for adding \"{}\" error: {}",
+            parent.display(),
+            entry.display(),
+        )?;
     }
 
     food_rs::result!(fs::copy(&src, dest), "copy \"{src_str}\" error: {}",)?;
