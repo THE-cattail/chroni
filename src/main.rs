@@ -264,7 +264,11 @@ fn keep_only_newest(
 
     for entry in &*include_files {
         if let Some(pattern) = matches(entry, only_newest) {
-            let created = src.join(entry).metadata()?.created()?;
+            let created = src
+                .join(entry)
+                .metadata()?
+                .created()
+                .map_or_else(|_| SystemTime::now(), |created| created);
 
             let insert = m.get(&pattern).map_or(true, |newest| {
                 if created > newest.created {
