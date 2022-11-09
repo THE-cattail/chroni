@@ -7,7 +7,7 @@ args = [
 ]
 dependencies = ["build-release"]
 
-[tasks.debug]
+[tasks.install-debug]
 command = "sudo"
 args = [
     "cp",

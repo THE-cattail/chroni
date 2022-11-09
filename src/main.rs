@@ -6,8 +6,11 @@ use std::{
     time::SystemTime,
 };
 
-use anyhow::{bail, Result};
 use clap::Parser;
+use color_eyre::eyre;
+use eyre::{bail, Result, WrapErr};
+use inquire::Confirm;
+use once_cell::sync::Lazy;
 use serde_derive::Deserialize;
 use sha1::{Digest, Sha1};
 use wildmatch::WildMatch;
@@ -54,12 +57,17 @@ struct Config {
 }
 
 fn main() -> Result<()> {
+    color_eyre::install()?;
+
     let config = initialize()?;
 
     for task in config.tasks {
         if let Err(e) = process_task(&task, config.dry_run) {
             println!("{e}");
-            if !food_rs::cli::ask_for_continue("with remain tasks")? {
+            if !Confirm::new("Continue with the remaining tasks?")
+                .with_default(true)
+                .prompt()?
+            {
                 bail!("user aborted.");
             };
         }
@@ -87,17 +95,12 @@ fn initialize() -> Result<Config> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args = CliArgs::parse();
+    let config_disp = args.config.display();
 
-    log::info!("Reading \"{}\"", args.config.display());
-    let config_slice = food_rs::result!(
-        fs::read(&args.config),
-        "reading \"{}\" error: {}",
-        args.config.display(),
-    )?;
-    let mut config: Config = food_rs::result!(
-        food_rs::config::parse(&config_slice),
-        "parsing config error: {}",
-    )?;
+    tracing::info!("Reading \"{}\"", config_disp);
+    let config_slice = fs::read(&args.config)
+        .wrap_err_with(|| format!("Failed to read config file: {config_disp}"))?;
+    let mut config: Config = toml::from_slice(&config_slice).wrap_err("Failed to parse config")?;
 
     config.dry_run = args.dry_run;
 
@@ -107,7 +110,7 @@ fn initialize() -> Result<Config> {
 fn process_task(task: &Task, dry_run: bool) -> Result<()> {
     let (src, dest) = get_src_dest_paths(task)?;
 
-    log::info!("Collecting include files");
+    tracing::info!("Collecting include files");
     let mut include_files = Vec::new();
     collect_files(
         &src,
@@ -118,11 +121,11 @@ fn process_task(task: &Task, dry_run: bool) -> Result<()> {
     )?;
 
     if let Some(only_newest) = &task.only_newest {
-        log::info!("Progressing only-newest lists");
+        tracing::info!("Progressing only-newest lists");
         keep_only_newest(&src, &mut include_files, only_newest)?;
     }
 
-    log::info!("Collecting exist files of destination directory");
+    tracing::info!("Collecting exist files of destination directory");
     let mut dest_exist_files = Vec::new();
     collect_files(
         &dest,
@@ -132,7 +135,7 @@ fn process_task(task: &Task, dry_run: bool) -> Result<()> {
         &mut dest_exist_files,
     )?;
 
-    log::info!("Generating to-do list");
+    tracing::info!("Generating to-do list");
     let (add_list, overwrite_list, remove_list) = generate_to_do_list(
         &src,
         &dest,
@@ -157,34 +160,32 @@ fn process_task(task: &Task, dry_run: bool) -> Result<()> {
 }
 
 fn get_src_dest_paths(task: &Task) -> Result<(PathBuf, PathBuf)> {
-    log::info!("Checking source path \"{}\"", task.src.display());
+    tracing::info!("Checking source path \"{}\"", task.src.display());
     if !task.src.is_dir() {
-        anyhow::bail!(
+        eyre::bail!(
             "check source path \"{}\" error: not a directory",
             task.src.display()
         );
     }
 
-    log::info!("Creating destination path \"{}\"", task.dest.display());
-    food_rs::result!(
-        fs::create_dir_all(&task.dest),
-        "create destination path \"{}\" error: {}",
-        task.dest.display(),
-    )?;
+    tracing::info!("Creating destination path \"{}\"", task.dest.display());
+    fs::create_dir_all(&task.dest)
+        .wrap_err_with(|| format!("Failed to create destination path: {}", task.dest.display(),))?;
 
-    log::info!("Getting absolute path of source and destination directory");
-    Ok((
-        food_rs::result!(
-            fs::canonicalize(&task.src),
-            "get absolute path of source path \"{}\" error: {}",
+    tracing::info!("Getting absolute path of source and destination directory");
+    let src = fs::canonicalize(&task.src).wrap_err_with(|| {
+        format!(
+            "Failed to get absolute path of source directory: {}",
             task.src.display(),
-        )?,
-        food_rs::result!(
-            fs::canonicalize(&task.dest),
-            "get absolute path of destination path \"{}\" error: {}",
+        )
+    })?;
+    let dest = fs::canonicalize(&task.dest).wrap_err_with(|| {
+        format!(
+            "Failed to get absolute path of destination directory: {}",
             task.dest.display(),
-        )?,
-    ))
+        )
+    })?;
+    Ok((src, dest))
 }
 
 fn matches(entry: &Path, patterns: &[String]) -> Option<String> {
@@ -199,9 +200,7 @@ fn matches(entry: &Path, patterns: &[String]) -> Option<String> {
     None
 }
 
-lazy_static::lazy_static! {
-    static ref ANY_PATTERN: Vec<String> = vec!["*".to_owned()];
-}
+static ANY_PATTERN: Lazy<Vec<String>> = Lazy::new(|| vec!["*".to_owned()]);
 
 fn collect_files(
     prefix: &Path,
@@ -211,9 +210,9 @@ fn collect_files(
     set: &mut Vec<PathBuf>,
 ) -> Result<()> {
     let path = prefix.join(entry);
-    let path_str = path.display();
+    let path_disp = path.display();
 
-    log::trace!("collect_files({path_str})");
+    tracing::trace!("collect_files({path_disp})");
 
     if !task
         .requires
@@ -222,7 +221,7 @@ fn collect_files(
     {
         if let Some(excludes) = &task.excludes {
             if matches(entry, excludes).is_some() {
-                log::trace!("matches(excludes: {path_str})");
+                tracing::trace!("matches(excludes: {path_disp})");
                 return Ok(());
             }
         }
@@ -243,7 +242,7 @@ fn collect_files(
     }
 
     if include {
-        log::trace!("set.push({})", entry.display());
+        tracing::trace!("set.push({})", entry.display());
         set.push(entry.to_owned());
     }
 
@@ -314,31 +313,31 @@ fn generate_to_do_list(
             continue;
         }
 
-        let entry_str = entry.display();
+        let entry_disp = entry.display();
 
         if !dest_exist_files.contains(entry) {
-            log::debug!("  + To add: {entry_str}");
+            tracing::debug!("  + To add: {entry_disp}");
             add_list.push(entry.clone());
             continue;
         }
 
         let dest = dest.join(entry);
 
-        let src_str = src.display();
-        let dest_str = dest.display();
+        let src_disp = src.display();
+        let dest_disp = dest.display();
 
-        log::debug!("? Comparing: \"{src_str}\" & \"{dest_str}\"");
+        tracing::debug!("? Comparing: \"{src_disp}\" & \"{dest_disp}\"");
         if need_overwrite(&src, &dest, overwrite_mode)? {
-            log::debug!("  ~ Skiped: {entry_str}");
+            tracing::debug!("  ~ Skiped: {entry_disp}");
         } else {
-            log::debug!("  ^ To overwrite: {entry_str}");
+            tracing::debug!("  ^ To overwrite: {entry_disp}");
             overwrite_list.push(entry.clone());
         }
     }
 
     for entry in dest_exist_files {
         if !include_files.contains(entry) {
-            log::debug!("  - To remove: {}", entry.display());
+            tracing::debug!("  - To remove: {}", entry.display());
             remove_list.push(entry.clone());
         }
     }
@@ -354,20 +353,18 @@ fn need_overwrite(src: &Path, dest: &Path, mode: &OverwriteMode) -> Result<bool>
         return Ok(true);
     }
 
-    let src_str = src.display();
-    let dest_str = dest.display();
+    let src_disp = src.display();
+    let dest_disp = dest.display();
 
-    if food_rs::result!(
-        src.metadata(),
-        "get metadata of source file \"{src_str}\" error: {}",
-    )?
-    .len()
-        != food_rs::result!(
-            dest.metadata(),
-            "get metadata of destination file \"{dest_str}\" error: {}",
-        )?
-        .len()
-    {
+    let src_len = src
+        .metadata()
+        .wrap_err_with(|| format!("Failed to get metadata of source file: {src_disp}",))?
+        .len();
+    let dest_len = dest
+        .metadata()
+        .wrap_err_with(|| format!("Failed to get metadata of destination file: {dest_disp}",))?
+        .len();
+    if src_len != dest_len {
         return Ok(false);
     }
 
@@ -375,27 +372,18 @@ fn need_overwrite(src: &Path, dest: &Path, mode: &OverwriteMode) -> Result<bool>
         return Ok(true);
     }
 
-    let mut src_file = food_rs::result!(
-        File::open(src),
-        "open source file \"{}\" error: {}",
-        src_str,
-    )?;
+    let mut src_file =
+        File::open(src).wrap_err_with(|| format!("Failed to open source file: {src_disp}"))?;
     let mut src_hasher = Sha1::new();
-    food_rs::result!(
-        io::copy(&mut src_file, &mut src_hasher),
-        "copy source file \"{src_str}\" to hasher error: {}",
-    )?;
+    io::copy(&mut src_file, &mut src_hasher)
+        .wrap_err_with(|| format!("Failed to copy source file to hasher: {src_disp}",))?;
     let src_hash = src_hasher.finalize();
 
-    let mut dest_file = food_rs::result!(
-        File::open(dest),
-        "open destination file \"{dest_str}\" error: {}",
-    )?;
+    let mut dest_file = File::open(dest)
+        .wrap_err_with(|| format!("Failed to open destination file: {dest_disp}",))?;
     let mut dest_hasher = Sha1::new();
-    food_rs::result!(
-        io::copy(&mut dest_file, &mut dest_hasher),
-        "copy destination file \"{dest_str}\" to hasher error: {}",
-    )?;
+    io::copy(&mut dest_file, &mut dest_hasher)
+        .wrap_err_with(|| format!("Failed to copy destination file to hasher: {dest_disp}",))?;
     let dest_hash = dest_hasher.finalize();
 
     Ok(src_hash == dest_hash)
@@ -410,12 +398,12 @@ fn execute_list(
 ) {
     if !list.is_empty() {
         let list_len = list.len();
-        log::info!("Execute {name} list");
+        tracing::info!("Execute {name} list");
         for (i, entry) in list.iter().enumerate() {
             if let Err(e) = (f)(src, dest, entry) {
-                log::warn!("{e}");
+                tracing::warn!("{e}");
             };
-            log::info!(
+            tracing::info!(
                 "[ {}% ] | [{}] {}",
                 (i + 1) * 100 / list_len,
                 name.to_uppercase(),
@@ -427,20 +415,18 @@ fn execute_list(
 
 fn remove(_: &Path, dest: &Path, entry: &Path) -> Result<()> {
     let path = dest.join(entry);
-    let path_str = path.display();
+    let path_disp = path.display();
 
-    log::debug!("* - Removing: {path_str}");
+    tracing::debug!("* - Removing: {path_disp}");
 
-    food_rs::result!(
-        if path.is_dir() {
-            log::trace!("remove dir");
-            fs::remove_dir(&path)
-        } else {
-            log::trace!("remove file");
-            fs::remove_file(&path)
-        },
-        "remove \"{path_str}\" error: {}",
-    )?;
+    if path.is_dir() {
+        tracing::trace!("remove dir");
+        fs::remove_dir(&path)
+    } else {
+        tracing::trace!("remove file");
+        fs::remove_file(&path)
+    }
+    .wrap_err_with(|| format!("Failed to remove: {path_disp}"))?;
 
     Ok(())
 }
@@ -450,50 +436,42 @@ const SUFFIX_CHRONI_DEST: &str = "chroni_dest";
 
 fn overwrite(src: &Path, dest: &Path, entry: &Path) -> Result<()> {
     let src = src.join(entry);
-    let src_str = src.display();
+    let src_disp = src.display();
 
     let dest = dest.join(entry);
-    let dest_str = dest.display();
+    let dest_disp = dest.display();
 
     let dest_new_tmp = {
         let mut path = dest.clone();
         path.set_extension(SUFFIX_CHRONI_SRC);
         path
     };
-    let dest_new_tmp_str = dest_new_tmp.display();
+    let dest_new_tmp_disp = dest_new_tmp.display();
 
     let dest_old_tmp = {
         let mut path = dest.clone();
         path.set_extension(SUFFIX_CHRONI_DEST);
         path
     };
-    let dest_old_tmp_str = dest_old_tmp.display();
+    let dest_old_tmp_disp = dest_old_tmp.display();
 
-    log::debug!("* ^ Overwriting: {src_str} -> {dest_str}");
+    tracing::debug!("* ^ Overwriting: {src_disp} -> {dest_disp}");
 
-    log::trace!("copy({src_str}, {dest_new_tmp_str})");
-    food_rs::result!(
-        fs::copy(&src, &dest_new_tmp),
-        "copy \"{src_str}\" for overwriting \"{dest_str}\" error: {}",
-    )?;
+    tracing::trace!("copy({src_disp}, {dest_new_tmp_disp})");
+    fs::copy(&src, &dest_new_tmp)
+        .wrap_err_with(|| format!("Failed to copy for overwriting {dest_disp}: {src_disp}"))?;
 
-    log::trace!("rename({dest_str}, {dest_old_tmp_str})");
-    food_rs::result!(
-        fs::rename(&dest, &dest_old_tmp),
-        "rename \"{dest_str}\" for overwriting \"{dest_str}\" error: {}",
-    )?;
+    tracing::trace!("rename({dest_disp}, {dest_old_tmp_disp})");
+    fs::rename(&dest, &dest_old_tmp)
+        .wrap_err_with(|| format!("Failed to rename for overwriting {dest_disp}: {dest_disp}"))?;
 
-    log::trace!("rename({dest_new_tmp_str}, {dest_str})");
-    food_rs::result!(
-        fs::rename(&dest_new_tmp, &dest),
-        "rename \"{dest_new_tmp_str}\" for overwriting \"{dest_str}\" error: {}",
-    )?;
+    tracing::trace!("rename({dest_new_tmp_disp}, {dest_disp})");
+    fs::rename(&dest_new_tmp, &dest)
+        .wrap_err_with(|| format!("rename for overwriting {dest_disp}: {dest_new_tmp_disp}"))?;
 
-    log::trace!("remove({dest_old_tmp_str})");
-    food_rs::result!(
-        fs::remove_file(&dest_old_tmp),
-        "remove \"{dest_old_tmp_str}\" for overwriting \"{dest_str}\" error: {}",
-    )?;
+    tracing::trace!("remove({dest_old_tmp_disp})");
+    fs::remove_file(&dest_old_tmp)
+        .wrap_err_with(|| format!("remove for overwriting {dest_disp}: {dest_old_tmp_disp}"))?;
 
     Ok(())
 }
@@ -502,22 +480,23 @@ fn add(src: &Path, dest: &Path, entry: &Path) -> Result<()> {
     let src = src.join(entry);
     let dest = dest.join(entry);
 
-    let src_str = src.display();
-    let dest_str = dest.display();
+    let src_disp = src.display();
+    let dest_disp = dest.display();
 
-    log::debug!("* + Adding: {src_str} -> {dest_str}");
+    tracing::debug!("* + Adding: {src_disp} -> {dest_disp}");
 
     if let Some(parent) = dest.parent() {
-        log::trace!("create dir all");
-        food_rs::result!(
-            fs::create_dir_all(parent),
-            "create directory \"{}\" for adding \"{}\" error: {}",
-            parent.display(),
-            entry.display(),
-        )?;
+        tracing::trace!("create dir all");
+        fs::create_dir_all(parent).wrap_err_with(|| {
+            format!(
+                "Failed to create directory for adding {} error: {}",
+                entry.display(),
+                parent.display(),
+            )
+        })?;
     }
 
-    food_rs::result!(fs::copy(&src, dest), "copy \"{src_str}\" error: {}",)?;
+    fs::copy(&src, dest).wrap_err_with(|| format!("Failed to copy: {src_disp}"))?;
 
     Ok(())
 }
