@@ -6,248 +6,155 @@ use std::{
     time::SystemTime,
 };
 
-use clap::Parser;
-use color_eyre::eyre;
-use eyre::{bail, Result, WrapErr};
-use inquire::Confirm;
-use once_cell::sync::Lazy;
-use serde_derive::Deserialize;
+use anyhow::{Context, Result};
+use clap::{Parser, ValueEnum, ValueHint};
+use globset::{Glob, GlobSet, GlobSetBuilder};
+use ignore::WalkBuilder;
+use indicatif::ProgressBar;
 use sha1::{Digest, Sha1};
-use wildmatch::WildMatch;
 
-#[derive(PartialEq)]
-#[derive(Deserialize)]
-#[derive(Default)]
+#[derive(Clone, ValueEnum, PartialEq)]
 enum OverwriteMode {
-    #[serde(rename = "any")]
+    #[value(help = "always overwrite")]
     Any,
-
-    #[serde(rename = "deep_compare")]
-    DeepCompare,
-
-    #[default]
-    #[serde(rename = "fast_compare")]
-    FastCompare,
-
-    #[serde(rename = "never")]
-    Never,
-}
-
-#[derive(Deserialize)]
-struct Task {
-    src:  PathBuf,
-    dest: PathBuf,
-
-    #[serde(default = "OverwriteMode::default")]
-    overwrite_mode: OverwriteMode,
-
-    includes: Vec<String>,
-    excludes: Option<Vec<String>>,
-    requires: Option<Vec<String>>,
-
-    only_newest: Option<Vec<String>>,
-}
-
-#[derive(Deserialize)]
-struct Config {
-    tasks: Vec<Task>,
-
-    #[serde(skip_deserializing)]
-    dry_run: bool,
-}
-
-fn main() -> Result<()> {
-    color_eyre::install()?;
-
-    let config = initialize()?;
-
-    for task in config.tasks {
-        if let Err(e) = process_task(&task, config.dry_run) {
-            println!("{e}");
-            if !Confirm::new("Continue with the remaining tasks?")
-                .with_default(true)
-                .prompt()?
-            {
-                bail!("user aborted.");
-            };
-        }
-    }
-
-    println!("chroni: All tasks done.");
-    Ok(())
+    #[value(help = "overwrite when sizes of the source and the destination are different")]
+    FastComp,
+    #[value(help = "overwrite when hashes(SHA-1) of the source and the destination are different")]
+    DeepComp,
+    #[value(help = "never overwrite")]
+    None,
 }
 
 #[derive(Parser)]
 #[command(author, version, about)]
-struct CliArgs {
-    #[arg(short, long, value_name = "FILE", help = "Specify configuration file",
-    value_hint = clap::ValueHint::FilePath, default_value = "config")]
-    config:  PathBuf,
+struct Task {
+    #[arg(value_name = "SRC_DIR", help = "The source directory of the backup task", value_hint = ValueHint::DirPath)]
+    src:            PathBuf,
+    #[arg(value_name = "DEST_DIR", help = "The destination directory of the backup task", value_hint = ValueHint::DirPath)]
+    dest:           PathBuf,
+    #[arg(
+        value_enum,
+        short,
+        long = "overwrite-mode",
+        value_name = "MODE",
+        help = "Specify the mode for checking if a destination file should be overwritten",
+        default_value_t = OverwriteMode::FastComp,
+    )]
+    overwrite_mode: OverwriteMode,
+    #[arg(
+        long = "only_newest",
+        value_name = "GLOB",
+        help = "Set the filter of directories which only keep the newest file in it, can be used \
+                multiple times"
+    )]
+    only_newest:    Vec<Glob>,
     #[arg(
         long = "dry-run",
         help = "Run without actual file operations",
-        default_value = "false"
+        default_value_t = false
     )]
-    dry_run: bool,
+    dry_run:        bool,
 }
 
-fn initialize() -> Result<Config> {
+fn main() -> Result<()> {
+    let task = initialize();
+    process_task(&task)?;
+    Ok(())
+}
+
+fn initialize() -> Task {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
-    let args = CliArgs::parse();
-    let config_disp = args.config.display();
-
-    tracing::info!("Reading \"{}\"", config_disp);
-    let config_slice = fs::read(&args.config)
-        .wrap_err_with(|| format!("Failed to read config file: {config_disp}"))?;
-    let mut config: Config = toml::from_slice(&config_slice).wrap_err("Failed to parse config")?;
-
-    config.dry_run = args.dry_run;
-
-    Ok(config)
+    Task::parse()
 }
 
-fn process_task(task: &Task, dry_run: bool) -> Result<()> {
+fn process_task(task: &Task) -> Result<()> {
     let (src, dest) = get_src_dest_paths(task)?;
 
-    tracing::info!("Collecting include files");
+    log::info!("Collecting include files");
     let mut include_files = Vec::new();
-    collect_files(
-        &src,
-        Path::new(""),
-        &task.includes,
-        task,
-        &mut include_files,
-    )?;
+    collect_files(&src, &mut include_files).context("Failed to collect include files")?;
 
-    if let Some(only_newest) = &task.only_newest {
-        tracing::info!("Progressing only-newest lists");
-        keep_only_newest(&src, &mut include_files, only_newest)?;
+    if !task.only_newest.is_empty() {
+        log::info!("Excluding old-version files insides only-newest directories");
+        keep_only_newest(
+            &src,
+            &mut include_files,
+            &generate_globset(&task.only_newest)
+                .context("Failed to generate globset from only-newest list")?,
+        )?;
     }
 
-    tracing::info!("Collecting exist files of destination directory");
+    log::info!("Collecting exist files of destination directory");
     let mut dest_exist_files = Vec::new();
-    collect_files(
-        &dest,
-        Path::new(""),
-        &task.includes,
-        task,
-        &mut dest_exist_files,
-    )?;
+    collect_files(&dest, &mut dest_exist_files)
+        .context("Failed to collect exist files of destination directory")?;
 
-    tracing::info!("Generating to-do list");
+    log::info!("Generating to-do list");
     let (add_list, overwrite_list, remove_list) = generate_to_do_list(
         &src,
         &dest,
         &include_files,
         &dest_exist_files,
         &task.overwrite_mode,
-    )?;
+    )
+    .context("Failed to generate to-do list")?;
 
-    if dry_run {
-        println!("chroni: Dry-run task for {} done.", src.display());
-
-        return Ok(());
+    if !task.dry_run {
+        execute_list("remove", &remove_list, remove, &src, &dest)
+            .context("Failed to execute remove list")?;
+        execute_list("overwrite", &overwrite_list, copy, &src, &dest)
+            .context("Failed to execute overwrite list")?;
+        execute_list("add", &add_list, copy, &src, &dest).context("Failed to execute add list")?;
     }
 
-    execute_list("remove", &remove_list, remove, &src, &dest);
-    execute_list("overwrite", &overwrite_list, overwrite, &src, &dest);
-    execute_list("add", &add_list, add, &src, &dest);
-
-    println!("chroni: Task for {} done.", src.display());
+    println!("chroni: Task done.");
 
     Ok(())
+}
+
+fn generate_globset(gs: &[Glob]) -> Result<GlobSet> {
+    let mut builder = GlobSetBuilder::new();
+    for g in gs {
+        builder.add(g.clone());
+
+        let g_dir_str = format!("{}/*", g.glob());
+        let g_dir = Glob::new(&g_dir_str)
+            .with_context(|| format!("Failed to generate glob: {g_dir_str}"))?;
+        builder.add(g_dir);
+    }
+    Ok(builder.build()?)
 }
 
 fn get_src_dest_paths(task: &Task) -> Result<(PathBuf, PathBuf)> {
-    tracing::info!("Checking source path \"{}\"", task.src.display());
+    log::info!("Checking source path \"{}\"", task.src.display());
     if !task.src.is_dir() {
-        eyre::bail!(
-            "check source path \"{}\" error: not a directory",
-            task.src.display()
-        );
+        anyhow::bail!("Source path is not a directory");
     }
 
-    tracing::info!("Creating destination path \"{}\"", task.dest.display());
-    fs::create_dir_all(&task.dest)
-        .wrap_err_with(|| format!("Failed to create destination path: {}", task.dest.display(),))?;
+    log::info!("Creating destination path \"{}\"", task.dest.display());
+    fs::create_dir_all(&task.dest).context("Failed to create destination path")?;
 
-    tracing::info!("Getting absolute path of source and destination directory");
-    let src = fs::canonicalize(&task.src).wrap_err_with(|| {
-        format!(
-            "Failed to get absolute path of source directory: {}",
-            task.src.display(),
-        )
-    })?;
-    let dest = fs::canonicalize(&task.dest).wrap_err_with(|| {
-        format!(
-            "Failed to get absolute path of destination directory: {}",
-            task.dest.display(),
-        )
-    })?;
+    log::info!("Getting absolute path of source and destination directory");
+    let src =
+        fs::canonicalize(&task.src).context("Failed to get absolute path of source directory")?;
+    let dest = fs::canonicalize(&task.dest)
+        .context("Failed to get absolute path of destination directory")?;
     Ok((src, dest))
 }
 
-fn matches(entry: &Path, patterns: &[String]) -> Option<String> {
-    for p in patterns {
-        if (p == "." && entry == Path::new(""))
-            || WildMatch::new(p).matches(&entry.display().to_string())
-        {
-            return Some(p.clone());
-        };
-    }
-
-    None
-}
-
-static ANY_PATTERN: Lazy<Vec<String>> = Lazy::new(|| vec!["*".to_owned()]);
-
-fn collect_files(
-    prefix: &Path,
-    entry: &Path,
-    includes: &[String],
-    task: &Task,
-    set: &mut Vec<PathBuf>,
-) -> Result<()> {
-    let path = prefix.join(entry);
-    let path_disp = path.display();
-
-    tracing::trace!("collect_files({path_disp})");
-
-    if !task
-        .requires
-        .as_ref()
-        .map_or(false, |requires| matches(entry, requires).is_some())
-    {
-        if let Some(excludes) = &task.excludes {
-            if matches(entry, excludes).is_some() {
-                tracing::trace!("matches(excludes: {path_disp})");
-                return Ok(());
-            }
-        }
-    }
-
-    let include = matches(entry, includes).is_some();
-
-    if path.is_dir() {
-        for entry in fs::read_dir(&path)? {
-            collect_files(
-                prefix,
-                entry?.path().strip_prefix(prefix)?,
-                if include { &ANY_PATTERN } else { includes },
-                task,
-                set,
-            )?;
-        }
-    }
-
-    if include {
-        tracing::trace!("set.push({})", entry.display());
-        set.push(entry.to_owned());
+fn collect_files(prefix: &Path, set: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in WalkBuilder::new(prefix).hidden(false).build() {
+        let entry = entry.context("Failed to get DirEntry when walking")?;
+        let path = entry
+            .path()
+            .strip_prefix(prefix)
+            .context("Failed to strip prefix")?;
+        set.push(path.to_owned());
     }
 
     Ok(())
 }
+
 struct Newest {
     entry:   PathBuf,
     created: SystemTime,
@@ -256,20 +163,22 @@ struct Newest {
 fn keep_only_newest(
     src: &Path,
     include_files: &mut Vec<PathBuf>,
-    only_newest: &[String],
+    only_newest: &GlobSet,
 ) -> Result<()> {
-    let mut m: HashMap<String, Newest> = HashMap::new();
+    let mut m: HashMap<usize, Newest> = HashMap::new();
     let mut to_removes = HashSet::new();
 
     for entry in &*include_files {
-        if let Some(pattern) = matches(entry, only_newest) {
-            let created = src
-                .join(entry)
-                .metadata()?
+        for seq in only_newest.matches(entry) {
+            let path = src.join(entry);
+            let metadata = path
+                .metadata()
+                .with_context(|| format!("Failed to get metadata: {}", path.display()))?;
+            let created = metadata
                 .created()
                 .map_or_else(|_| SystemTime::now(), |created| created);
 
-            let insert = m.get(&pattern).map_or(true, |newest| {
+            let insert = m.get(&seq).map_or(true, |newest| {
                 if created > newest.created {
                     to_removes.insert(newest.entry.clone());
                     true
@@ -281,7 +190,7 @@ fn keep_only_newest(
 
             if insert {
                 m.insert(
-                    pattern,
+                    seq,
                     Newest {
                         entry: entry.clone(),
                         created,
@@ -316,7 +225,7 @@ fn generate_to_do_list(
         let entry_disp = entry.display();
 
         if !dest_exist_files.contains(entry) {
-            tracing::debug!("  + To add: {entry_disp}");
+            log::debug!("  + To add: {entry_disp}");
             add_list.push(entry.clone());
             continue;
         }
@@ -326,18 +235,24 @@ fn generate_to_do_list(
         let src_disp = src.display();
         let dest_disp = dest.display();
 
-        tracing::debug!("? Comparing: \"{src_disp}\" & \"{dest_disp}\"");
-        if need_overwrite(&src, &dest, overwrite_mode)? {
-            tracing::debug!("  ~ Skiped: {entry_disp}");
+        log::debug!("? Comparing: \"{src_disp}\" & \"{dest_disp}\"");
+        if need_overwrite(&src, &dest, overwrite_mode).with_context(|| {
+            format!(
+                "Failed to check overwrite: {} -> {}",
+                src.display(),
+                dest.display()
+            )
+        })? {
+            log::debug!("  ~ Skiped: {entry_disp}");
         } else {
-            tracing::debug!("  ^ To overwrite: {entry_disp}");
+            log::debug!("  ^ To overwrite: {entry_disp}");
             overwrite_list.push(entry.clone());
         }
     }
 
     for entry in dest_exist_files {
         if !include_files.contains(entry) {
-            tracing::debug!("  - To remove: {}", entry.display());
+            log::debug!("  - To remove: {}", entry.display());
             remove_list.push(entry.clone());
         }
     }
@@ -349,7 +264,7 @@ fn need_overwrite(src: &Path, dest: &Path, mode: &OverwriteMode) -> Result<bool>
     if mode == &OverwriteMode::Any {
         return Ok(false);
     }
-    if mode == &OverwriteMode::Never {
+    if mode == &OverwriteMode::None {
         return Ok(true);
     }
 
@@ -358,32 +273,32 @@ fn need_overwrite(src: &Path, dest: &Path, mode: &OverwriteMode) -> Result<bool>
 
     let src_len = src
         .metadata()
-        .wrap_err_with(|| format!("Failed to get metadata of source file: {src_disp}",))?
+        .with_context(|| format!("Failed to get metadata of source file: {src_disp}",))?
         .len();
     let dest_len = dest
         .metadata()
-        .wrap_err_with(|| format!("Failed to get metadata of destination file: {dest_disp}",))?
+        .with_context(|| format!("Failed to get metadata of destination file: {dest_disp}",))?
         .len();
     if src_len != dest_len {
         return Ok(false);
     }
 
-    if mode == &OverwriteMode::FastCompare {
+    if mode == &OverwriteMode::FastComp {
         return Ok(true);
     }
 
     let mut src_file =
-        File::open(src).wrap_err_with(|| format!("Failed to open source file: {src_disp}"))?;
+        File::open(src).with_context(|| format!("Failed to open source file: {src_disp}"))?;
     let mut src_hasher = Sha1::new();
     io::copy(&mut src_file, &mut src_hasher)
-        .wrap_err_with(|| format!("Failed to copy source file to hasher: {src_disp}",))?;
+        .with_context(|| format!("Failed to copy source file to hasher: {src_disp}"))?;
     let src_hash = src_hasher.finalize();
 
     let mut dest_file = File::open(dest)
-        .wrap_err_with(|| format!("Failed to open destination file: {dest_disp}",))?;
+        .with_context(|| format!("Failed to open destination file: {dest_disp}"))?;
     let mut dest_hasher = Sha1::new();
     io::copy(&mut dest_file, &mut dest_hasher)
-        .wrap_err_with(|| format!("Failed to copy destination file to hasher: {dest_disp}",))?;
+        .with_context(|| format!("Failed to copy destination file to hasher: {dest_disp}"))?;
     let dest_hash = dest_hasher.finalize();
 
     Ok(src_hash == dest_hash)
@@ -395,108 +310,67 @@ fn execute_list(
     f: fn(&Path, &Path, &Path) -> Result<()>,
     src: &Path,
     dest: &Path,
-) {
+) -> Result<()> {
     if !list.is_empty() {
         let list_len = list.len();
-        tracing::info!("Execute {name} list");
+        log::info!("Execute {name} list");
+        let bar = ProgressBar::new(
+            list_len
+                .try_into()
+                .context("Failed to get ProgressBar length")?,
+        );
         for (i, entry) in list.iter().enumerate() {
             if let Err(e) = (f)(src, dest, entry) {
-                tracing::warn!("{e}");
+                log::warn!("Failed to execute {name} task:\n{e}");
             };
-            tracing::info!(
+            bar.inc(1);
+            log::info!(
                 "[ {}% ] | [{}] {}",
                 (i + 1) * 100 / list_len,
                 name.to_uppercase(),
                 entry.display()
             );
         }
+        bar.finish();
     }
+
+    Ok(())
 }
 
 fn remove(_: &Path, dest: &Path, entry: &Path) -> Result<()> {
     let path = dest.join(entry);
     let path_disp = path.display();
 
-    tracing::debug!("* - Removing: {path_disp}");
+    log::debug!("* - Removing: {path_disp}");
 
     if path.is_dir() {
-        tracing::trace!("remove dir");
+        log::trace!("remove dir");
         fs::remove_dir(&path)
     } else {
-        tracing::trace!("remove file");
+        log::trace!("remove file");
         fs::remove_file(&path)
     }
-    .wrap_err_with(|| format!("Failed to remove: {path_disp}"))?;
+    .with_context(|| format!("Failed to remove: {path_disp}"))?;
 
     Ok(())
 }
 
-const SUFFIX_CHRONI_SRC: &str = "chroni_src";
-const SUFFIX_CHRONI_DEST: &str = "chroni_dest";
-
-fn overwrite(src: &Path, dest: &Path, entry: &Path) -> Result<()> {
-    let src = src.join(entry);
-    let src_disp = src.display();
-
-    let dest = dest.join(entry);
-    let dest_disp = dest.display();
-
-    let dest_new_tmp = {
-        let mut path = dest.clone();
-        path.set_extension(SUFFIX_CHRONI_SRC);
-        path
-    };
-    let dest_new_tmp_disp = dest_new_tmp.display();
-
-    let dest_old_tmp = {
-        let mut path = dest.clone();
-        path.set_extension(SUFFIX_CHRONI_DEST);
-        path
-    };
-    let dest_old_tmp_disp = dest_old_tmp.display();
-
-    tracing::debug!("* ^ Overwriting: {src_disp} -> {dest_disp}");
-
-    tracing::trace!("copy({src_disp}, {dest_new_tmp_disp})");
-    fs::copy(&src, &dest_new_tmp)
-        .wrap_err_with(|| format!("Failed to copy for overwriting {dest_disp}: {src_disp}"))?;
-
-    tracing::trace!("rename({dest_disp}, {dest_old_tmp_disp})");
-    fs::rename(&dest, &dest_old_tmp)
-        .wrap_err_with(|| format!("Failed to rename for overwriting {dest_disp}: {dest_disp}"))?;
-
-    tracing::trace!("rename({dest_new_tmp_disp}, {dest_disp})");
-    fs::rename(&dest_new_tmp, &dest)
-        .wrap_err_with(|| format!("rename for overwriting {dest_disp}: {dest_new_tmp_disp}"))?;
-
-    tracing::trace!("remove({dest_old_tmp_disp})");
-    fs::remove_file(&dest_old_tmp)
-        .wrap_err_with(|| format!("remove for overwriting {dest_disp}: {dest_old_tmp_disp}"))?;
-
-    Ok(())
-}
-
-fn add(src: &Path, dest: &Path, entry: &Path) -> Result<()> {
+fn copy(src: &Path, dest: &Path, entry: &Path) -> Result<()> {
     let src = src.join(entry);
     let dest = dest.join(entry);
 
     let src_disp = src.display();
     let dest_disp = dest.display();
 
-    tracing::debug!("* + Adding: {src_disp} -> {dest_disp}");
+    log::debug!("* + Adding: {src_disp} -> {dest_disp}");
 
     if let Some(parent) = dest.parent() {
-        tracing::trace!("create dir all");
-        fs::create_dir_all(parent).wrap_err_with(|| {
-            format!(
-                "Failed to create directory for adding {} error: {}",
-                entry.display(),
-                parent.display(),
-            )
-        })?;
+        log::trace!("create dir all");
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create directory error: {}", parent.display(),))?;
     }
 
-    fs::copy(&src, dest).wrap_err_with(|| format!("Failed to copy: {src_disp}"))?;
+    fs::copy(&src, dest).with_context(|| format!("Failed to copy: {src_disp}"))?;
 
     Ok(())
 }
