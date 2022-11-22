@@ -1,4 +1,6 @@
 use std::{
+    borrow::Cow,
+    cmp::Ordering,
     collections::{HashMap, HashSet},
     fs::{self, File},
     io,
@@ -10,19 +12,96 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum, ValueHint};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
-use indicatif::ProgressBar;
+use indicatif::{ProgressBar, ProgressStyle};
 use sha1::{Digest, Sha1};
 
-#[derive(Clone, ValueEnum, PartialEq)]
+fn main() -> Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    let mut task = Task::parse();
+    task.process()?;
+
+    Ok(())
+}
+
+#[derive(Clone, Copy, ValueEnum, PartialEq)]
 enum OverwriteMode {
     #[value(help = "always overwrite")]
-    Any,
+    Always,
     #[value(help = "overwrite when sizes of the source and the destination are different")]
     FastComp,
-    #[value(help = "overwrite when hashes(SHA-1) of the source and the destination are different")]
+    #[value(help = "overwrite when hashsum of the source and the destination are different")]
     DeepComp,
     #[value(help = "never overwrite")]
-    None,
+    Never,
+}
+
+struct Term {
+    term:     console::Term,
+    progress: Option<ProgressBar>,
+}
+
+impl Term {
+    fn act(&self, action: &str, desc: &str) -> Result<()> {
+        self.term.write_line(&format!(
+            "{: >12} {}",
+            console::style(action).bold().cyan(),
+            desc
+        ))?;
+        Ok(())
+    }
+
+    fn new_progress_without_bar(&mut self, prefix: impl Into<Cow<'static, str>>) -> Result<()> {
+        self.progress = Some(
+            ProgressBar::new(0)
+                .with_style(ProgressStyle::with_template(
+                    "{prefix:>12.bold.cyan} {msg}",
+                )?)
+                .with_prefix(prefix),
+        );
+        Ok(())
+    }
+
+    fn new_progress(&mut self, len: usize, prefix: impl Into<Cow<'static, str>>) -> Result<()> {
+        self.progress = Some(
+            ProgressBar::new(len.try_into()?)
+                .with_style(
+                    ProgressStyle::with_template(
+                        "{prefix:>12.bold.cyan} [{bar:27}] {pos}/{len}: {msg}",
+                    )?
+                    .progress_chars("=> "),
+                )
+                .with_prefix(prefix),
+        );
+        Ok(())
+    }
+
+    fn progress_msg(&self, msg: impl Into<Cow<'static, str>>) {
+        if let Some(progress) = &self.progress {
+            progress.set_message(msg);
+        }
+    }
+
+    fn progress_inc(&self) {
+        if let Some(progress) = &self.progress {
+            progress.inc(1);
+        }
+    }
+
+    fn progress_finish(&self) {
+        if let Some(progress) = &self.progress {
+            progress.finish_and_clear();
+        }
+    }
+}
+
+impl Default for Term {
+    fn default() -> Self {
+        Self {
+            term:     console::Term::stdout(),
+            progress: None,
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -42,7 +121,7 @@ struct Task {
     )]
     overwrite_mode: OverwriteMode,
     #[arg(
-        long = "only_newest",
+        long = "only-newest",
         value_name = "GLOB",
         help = "Set the filter of directories which only keep the newest file in it, can be used \
                 multiple times"
@@ -54,105 +133,257 @@ struct Task {
         default_value_t = false
     )]
     dry_run:        bool,
+
+    #[clap(skip)]
+    term: Term,
 }
 
-fn main() -> Result<()> {
-    let task = initialize();
-    process_task(&task)?;
-    Ok(())
-}
+impl Task {
+    fn process(&mut self) -> Result<()> {
+        let (src, dest) = self.get_src_dest_paths()?;
 
-fn initialize() -> Task {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    Task::parse()
-}
+        self.term
+            .act("Collecting", &format!("src `{}`", src.display()))?;
+        let mut include_files = self
+            .collect_files(&src)
+            .context("Failed to collect include files")?;
 
-fn process_task(task: &Task) -> Result<()> {
-    let (src, dest) = get_src_dest_paths(task)?;
+        if !self.only_newest.is_empty() {
+            self.term.act("Progressing", "only-newest list")?;
+            self.keep_only_newest(
+                &src,
+                &mut include_files,
+                &generate_globset(&self.only_newest)
+                    .context("Failed to generate globset from only-newest list")?,
+            )?;
+        }
 
-    log::info!("Collecting include files");
-    let mut include_files = Vec::new();
-    collect_files(&src, &mut include_files).context("Failed to collect include files")?;
+        self.term
+            .act("Collecting", &format!("dest `{}`", dest.display()))?;
+        let dest_files = self
+            .collect_files(&dest)
+            .context("Failed to collect exist files of destination directory")?;
 
-    if !task.only_newest.is_empty() {
-        log::info!("Excluding old-version files insides only-newest directories");
-        keep_only_newest(
-            &src,
-            &mut include_files,
-            &generate_globset(&task.only_newest)
-                .context("Failed to generate globset from only-newest list")?,
-        )?;
-    }
+        self.term.act("Generating", "to-do list")?;
+        let (add_list, overwrite_list, remove_list) = self
+            .generate_to_do_list(
+                &src,
+                &dest,
+                &include_files,
+                &dest_files,
+                self.overwrite_mode,
+            )
+            .context("Failed to generate to-do list")?;
 
-    log::info!("Collecting exist files of destination directory");
-    let mut dest_exist_files = Vec::new();
-    collect_files(&dest, &mut dest_exist_files)
-        .context("Failed to collect exist files of destination directory")?;
-
-    log::info!("Generating to-do list");
-    let (add_list, overwrite_list, remove_list) = generate_to_do_list(
-        &src,
-        &dest,
-        &include_files,
-        &dest_exist_files,
-        &task.overwrite_mode,
-    )
-    .context("Failed to generate to-do list")?;
-
-    if !task.dry_run {
-        execute_list("remove", &remove_list, remove, &src, &dest)
-            .context("Failed to execute remove list")?;
-        execute_list("overwrite", &overwrite_list, copy, &src, &dest)
+        if !self.dry_run {
+            self.execute_list("remove", "Removing", &remove_list, remove, &src, &dest)
+                .context("Failed to execute remove list")?;
+            self.execute_list(
+                "overwrite",
+                "Overwriting",
+                &overwrite_list,
+                copy,
+                &src,
+                &dest,
+            )
             .context("Failed to execute overwrite list")?;
-        execute_list("add", &add_list, copy, &src, &dest).context("Failed to execute add list")?;
+            self.execute_list("add", "Adding", &add_list, copy, &src, &dest)
+                .context("Failed to execute add list")?;
+        }
+
+        self.term.act(
+            "Finished",
+            &format!("backup `{}` to `{}`", src.display(), dest.display()),
+        )?;
+
+        Ok(())
     }
 
-    println!("chroni: Task done.");
+    fn get_src_dest_paths(&self) -> Result<(PathBuf, PathBuf)> {
+        if !self.src.is_dir() {
+            anyhow::bail!("Source path is not a directory");
+        }
 
-    Ok(())
+        fs::create_dir_all(&self.dest).context("Failed to create destination path")?;
+
+        let src = fs::canonicalize(&self.src)
+            .context("Failed to get absolute path of source directory")?;
+        let dest = fs::canonicalize(&self.dest)
+            .context("Failed to get absolute path of destination directory")?;
+        Ok((src, dest))
+    }
+
+    fn collect_files(&mut self, path: &Path) -> Result<Vec<PathBuf>> {
+        let mut ret = Vec::new();
+
+        self.term.new_progress_without_bar("Walking")?;
+        for entry in WalkBuilder::new(path)
+            .hidden(false)
+            .parents(false)
+            .sort_by_file_path(path_cmp)
+            .build()
+        {
+            let entry = entry?;
+            let entry_path = entry.path();
+            self.term.progress_msg(entry_path.display().to_string());
+
+            let path = entry_path.strip_prefix(path)?;
+            ret.push(path.to_owned());
+        }
+        self.term.progress_finish();
+
+        Ok(ret)
+    }
+
+    fn keep_only_newest(
+        &mut self,
+        src: &Path,
+        include_files: &mut Vec<PathBuf>,
+        only_newest: &GlobSet,
+    ) -> Result<()> {
+        let mut m: HashMap<usize, Newest> = HashMap::new();
+        let mut to_removes = HashSet::new();
+
+        self.term.new_progress(include_files.len(), "Checking")?;
+        for entry in &*include_files {
+            self.term.progress_msg(entry.display().to_string());
+
+            for seq in only_newest.matches(entry) {
+                let path = src.join(entry);
+                let metadata = path
+                    .metadata()
+                    .with_context(|| format!("Failed to get metadata: {}", path.display()))?;
+                let created = metadata
+                    .created()
+                    .map_or_else(|_| SystemTime::now(), |created| created);
+
+                let insert = m.get(&seq).map_or(true, |newest| {
+                    if created > newest.created {
+                        to_removes.insert(newest.entry.clone());
+                        true
+                    } else {
+                        to_removes.insert(entry.clone());
+                        false
+                    }
+                });
+
+                if insert {
+                    m.insert(
+                        seq,
+                        Newest {
+                            entry: entry.clone(),
+                            created,
+                        },
+                    );
+                }
+            }
+
+            self.term.progress_inc();
+        }
+        self.term.progress_finish();
+
+        include_files.retain(|e| !to_removes.contains(e));
+
+        Ok(())
+    }
+
+    fn generate_to_do_list(
+        &mut self,
+        src: &Path,
+        dest: &Path,
+        include_files: &[PathBuf],
+        dest_files: &[PathBuf],
+        overwrite_mode: OverwriteMode,
+    ) -> Result<(Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>)> {
+        let mut add_list = Vec::new();
+        let mut overwrite_list = Vec::new();
+        let mut remove_list = Vec::new();
+
+        self.term.new_progress(include_files.len(), "Checking")?;
+        for entry in include_files {
+            let entry_disp = entry.display();
+            self.term.progress_msg(entry_disp.to_string());
+
+            let src = src.join(entry);
+            if src.is_dir() {
+                continue;
+            }
+
+            if !dest_files.contains(entry) {
+                log::debug!("+ {entry_disp}");
+                add_list.push(entry.clone());
+                continue;
+            }
+
+            let dest = dest.join(entry);
+
+            if need_overwrite(&src, &dest, overwrite_mode).with_context(|| {
+                format!(
+                    "Failed to check overwrite: {} -> {}",
+                    src.display(),
+                    dest.display()
+                )
+            })? {
+                log::debug!("~ {entry_disp}");
+            } else {
+                log::debug!("^ {entry_disp}");
+                overwrite_list.push(entry.clone());
+            }
+            self.term.progress_inc();
+        }
+        self.term.progress_finish();
+
+        self.term.new_progress(dest_files.len(), "Checking")?;
+        for entry in dest_files {
+            let entry_disp = entry.display();
+            self.term.progress_msg(entry_disp.to_string());
+            if !include_files.contains(entry) {
+                log::debug!("- {}", entry_disp);
+                remove_list.push(entry.clone());
+            }
+            self.term.progress_inc();
+        }
+        self.term.progress_finish();
+
+        Ok((add_list, overwrite_list, remove_list))
+    }
+
+    fn execute_list(
+        &mut self,
+        name: &str,
+        action: impl Into<Cow<'static, str>>,
+        list: &[PathBuf],
+        f: fn(&Path, &Path, &Path) -> Result<()>,
+        src: &Path,
+        dest: &Path,
+    ) -> Result<()> {
+        if !list.is_empty() {
+            self.term.act("Processing", &format!("{name} list"))?;
+            self.term.new_progress(list.len(), action)?;
+            for entry in list.iter() {
+                self.term.progress_msg(entry.display().to_string());
+                if let Err(e) = (f)(src, dest, entry) {
+                    log::warn!("Failed to execute {name} task:\n{e:?}");
+                };
+            }
+            self.term.progress_finish();
+        }
+
+        Ok(())
+    }
 }
 
 fn generate_globset(gs: &[Glob]) -> Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     for g in gs {
         builder.add(g.clone());
-
-        let g_dir_str = format!("{}/*", g.glob());
-        let g_dir = Glob::new(&g_dir_str)
-            .with_context(|| format!("Failed to generate glob: {g_dir_str}"))?;
-        builder.add(g_dir);
+        builder.add(Glob::new(&format!("{}/*", g.glob()))?);
     }
     Ok(builder.build()?)
 }
 
-fn get_src_dest_paths(task: &Task) -> Result<(PathBuf, PathBuf)> {
-    log::info!("Checking source path \"{}\"", task.src.display());
-    if !task.src.is_dir() {
-        anyhow::bail!("Source path is not a directory");
-    }
-
-    log::info!("Creating destination path \"{}\"", task.dest.display());
-    fs::create_dir_all(&task.dest).context("Failed to create destination path")?;
-
-    log::info!("Getting absolute path of source and destination directory");
-    let src =
-        fs::canonicalize(&task.src).context("Failed to get absolute path of source directory")?;
-    let dest = fs::canonicalize(&task.dest)
-        .context("Failed to get absolute path of destination directory")?;
-    Ok((src, dest))
-}
-
-fn collect_files(prefix: &Path, set: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in WalkBuilder::new(prefix).hidden(false).build() {
-        let entry = entry.context("Failed to get DirEntry when walking")?;
-        let path = entry
-            .path()
-            .strip_prefix(prefix)
-            .context("Failed to strip prefix")?;
-        set.push(path.to_owned());
-    }
-
-    Ok(())
+fn path_cmp(left: &Path, right: &Path) -> Ordering {
+    right.cmp(left)
 }
 
 struct Newest {
@@ -160,111 +391,11 @@ struct Newest {
     created: SystemTime,
 }
 
-fn keep_only_newest(
-    src: &Path,
-    include_files: &mut Vec<PathBuf>,
-    only_newest: &GlobSet,
-) -> Result<()> {
-    let mut m: HashMap<usize, Newest> = HashMap::new();
-    let mut to_removes = HashSet::new();
-
-    for entry in &*include_files {
-        for seq in only_newest.matches(entry) {
-            let path = src.join(entry);
-            let metadata = path
-                .metadata()
-                .with_context(|| format!("Failed to get metadata: {}", path.display()))?;
-            let created = metadata
-                .created()
-                .map_or_else(|_| SystemTime::now(), |created| created);
-
-            let insert = m.get(&seq).map_or(true, |newest| {
-                if created > newest.created {
-                    to_removes.insert(newest.entry.clone());
-                    true
-                } else {
-                    to_removes.insert(entry.clone());
-                    false
-                }
-            });
-
-            if insert {
-                m.insert(
-                    seq,
-                    Newest {
-                        entry: entry.clone(),
-                        created,
-                    },
-                );
-            }
-        }
-    }
-
-    include_files.retain(|e| !to_removes.contains(e));
-
-    Ok(())
-}
-
-fn generate_to_do_list(
-    src: &Path,
-    dest: &Path,
-    include_files: &[PathBuf],
-    dest_exist_files: &[PathBuf],
-    overwrite_mode: &OverwriteMode,
-) -> Result<(Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>)> {
-    let mut add_list = Vec::new();
-    let mut overwrite_list = Vec::new();
-    let mut remove_list = Vec::new();
-
-    for entry in include_files {
-        let src = src.join(entry);
-        if src.is_dir() {
-            continue;
-        }
-
-        let entry_disp = entry.display();
-
-        if !dest_exist_files.contains(entry) {
-            log::debug!("  + To add: {entry_disp}");
-            add_list.push(entry.clone());
-            continue;
-        }
-
-        let dest = dest.join(entry);
-
-        let src_disp = src.display();
-        let dest_disp = dest.display();
-
-        log::debug!("? Comparing: \"{src_disp}\" & \"{dest_disp}\"");
-        if need_overwrite(&src, &dest, overwrite_mode).with_context(|| {
-            format!(
-                "Failed to check overwrite: {} -> {}",
-                src.display(),
-                dest.display()
-            )
-        })? {
-            log::debug!("  ~ Skiped: {entry_disp}");
-        } else {
-            log::debug!("  ^ To overwrite: {entry_disp}");
-            overwrite_list.push(entry.clone());
-        }
-    }
-
-    for entry in dest_exist_files {
-        if !include_files.contains(entry) {
-            log::debug!("  - To remove: {}", entry.display());
-            remove_list.push(entry.clone());
-        }
-    }
-
-    Ok((add_list, overwrite_list, remove_list))
-}
-
-fn need_overwrite(src: &Path, dest: &Path, mode: &OverwriteMode) -> Result<bool> {
-    if mode == &OverwriteMode::Any {
+fn need_overwrite(src: &Path, dest: &Path, mode: OverwriteMode) -> Result<bool> {
+    if mode == OverwriteMode::Always {
         return Ok(false);
     }
-    if mode == &OverwriteMode::None {
+    if mode == OverwriteMode::Never {
         return Ok(true);
     }
 
@@ -283,7 +414,7 @@ fn need_overwrite(src: &Path, dest: &Path, mode: &OverwriteMode) -> Result<bool>
         return Ok(false);
     }
 
-    if mode == &OverwriteMode::FastComp {
+    if mode == OverwriteMode::FastComp {
         return Ok(true);
     }
 
@@ -304,53 +435,15 @@ fn need_overwrite(src: &Path, dest: &Path, mode: &OverwriteMode) -> Result<bool>
     Ok(src_hash == dest_hash)
 }
 
-fn execute_list(
-    name: &str,
-    list: &[PathBuf],
-    f: fn(&Path, &Path, &Path) -> Result<()>,
-    src: &Path,
-    dest: &Path,
-) -> Result<()> {
-    if !list.is_empty() {
-        let list_len = list.len();
-        log::info!("Execute {name} list");
-        let bar = ProgressBar::new(
-            list_len
-                .try_into()
-                .context("Failed to get ProgressBar length")?,
-        );
-        for (i, entry) in list.iter().enumerate() {
-            if let Err(e) = (f)(src, dest, entry) {
-                log::warn!("Failed to execute {name} task:\n{e}");
-            };
-            bar.inc(1);
-            log::info!(
-                "[ {}% ] | [{}] {}",
-                (i + 1) * 100 / list_len,
-                name.to_uppercase(),
-                entry.display()
-            );
-        }
-        bar.finish();
-    }
-
-    Ok(())
-}
-
 fn remove(_: &Path, dest: &Path, entry: &Path) -> Result<()> {
     let path = dest.join(entry);
-    let path_disp = path.display();
-
-    log::debug!("* - Removing: {path_disp}");
 
     if path.is_dir() {
-        log::trace!("remove dir");
         fs::remove_dir(&path)
     } else {
-        log::trace!("remove file");
         fs::remove_file(&path)
     }
-    .with_context(|| format!("Failed to remove: {path_disp}"))?;
+    .with_context(|| format!("Failed to remove: {}", path.display()))?;
 
     Ok(())
 }
@@ -359,18 +452,12 @@ fn copy(src: &Path, dest: &Path, entry: &Path) -> Result<()> {
     let src = src.join(entry);
     let dest = dest.join(entry);
 
-    let src_disp = src.display();
-    let dest_disp = dest.display();
-
-    log::debug!("* + Adding: {src_disp} -> {dest_disp}");
-
     if let Some(parent) = dest.parent() {
-        log::trace!("create dir all");
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create directory error: {}", parent.display(),))?;
     }
 
-    fs::copy(&src, dest).with_context(|| format!("Failed to copy: {src_disp}"))?;
+    fs::copy(&src, dest).with_context(|| format!("Failed to copy: {}", src.display()))?;
 
     Ok(())
 }

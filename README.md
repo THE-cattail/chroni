@@ -19,12 +19,12 @@ Options:
           [default: fast-comp]
 
           Possible values:
-          - any:       always overwrite
+          - always:    always overwrite
           - fast-comp: overwrite when sizes of the source and the destination are different
-          - deep-comp: overwrite when hashes(SHA-1) of the source and the destination are different
-          - none:      never overwrite
+          - deep-comp: overwrite when hashsum of the source and the destination are different
+          - never:     never overwrite
 
-      --only_newest <GLOB>
+      --only-newest <GLOB>
           Set the filter of directories which only keep the newest file in it, can be used multiple times
 
       --dry-run
