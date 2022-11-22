@@ -217,12 +217,7 @@ impl Task {
         let mut ret = Vec::new();
 
         self.term.new_progress_without_bar("Walking")?;
-        for entry in WalkBuilder::new(path)
-            .hidden(false)
-            .parents(false)
-            .sort_by_file_path(path_cmp)
-            .build()
-        {
+        for entry in WalkBuilder::new(path).hidden(false).parents(false).build() {
             let entry = entry?;
             let entry_path = entry.path();
             self.term.progress_msg(entry_path.display().to_string());
@@ -343,6 +338,7 @@ impl Task {
             }
             self.term.progress_inc();
         }
+        remove_list.sort_unstable_by(path_cmp);
         self.term.progress_finish();
 
         Ok((add_list, overwrite_list, remove_list))
@@ -382,7 +378,7 @@ fn generate_globset(gs: &[Glob]) -> Result<GlobSet> {
     Ok(builder.build()?)
 }
 
-fn path_cmp(left: &Path, right: &Path) -> Ordering {
+fn path_cmp(left: &PathBuf, right: &PathBuf) -> Ordering {
     right.cmp(left)
 }
 
