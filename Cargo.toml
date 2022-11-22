@@ -1,6 +1,6 @@
 [package]
 name = "chroni"
-version = "0.6.0"
+version = "1.0.0"
 authors = ["猫羽黑夜 <THE_cattail@k-neco.moe>"]
 edition = "2021"
 description = "A mirror backup tool by Cattail Magic Lab"
