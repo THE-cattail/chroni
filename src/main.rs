@@ -361,6 +361,7 @@ impl Task {
                 if let Err(e) = (f)(src, dest, entry) {
                     log::warn!("Failed to execute {name} task:\n{e:?}");
                 };
+                self.term.progress_inc();
             }
             self.term.progress_finish();
         }
