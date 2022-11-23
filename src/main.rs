@@ -97,14 +97,7 @@ impl Term {
 impl Default for Term {
     fn default() -> Self {
         Self {
-            term:     {
-                let term = console::Term::stdout();
-                if term.hide_cursor().is_ok() {
-                    term
-                } else {
-                    console::Term::stdout()
-                }
-            },
+            term:     console::Term::stdout(),
             progress: None,
         }
     }
