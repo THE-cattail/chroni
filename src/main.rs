@@ -1,6 +1,5 @@
 use std::{
     borrow::Cow,
-    cmp::Ordering,
     collections::{HashMap, HashSet},
     fs::{self, File},
     io,
@@ -98,7 +97,14 @@ impl Term {
 impl Default for Term {
     fn default() -> Self {
         Self {
-            term:     console::Term::stdout(),
+            term:     {
+                let term = console::Term::stdout();
+                if term.hide_cursor().is_ok() {
+                    term
+                } else {
+                    console::Term::stdout()
+                }
+            },
             progress: None,
         }
     }
@@ -338,7 +344,7 @@ impl Task {
             }
             self.term.progress_inc();
         }
-        remove_list.sort_unstable_by(path_cmp);
+        remove_list.sort_unstable_by(|a, b| a.cmp(b).reverse());
         self.term.progress_finish();
 
         Ok((add_list, overwrite_list, remove_list))
@@ -377,10 +383,6 @@ fn generate_globset(gs: &[Glob]) -> Result<GlobSet> {
         builder.add(Glob::new(&format!("{}/*", g.glob()))?);
     }
     Ok(builder.build()?)
-}
-
-fn path_cmp(left: &PathBuf, right: &PathBuf) -> Ordering {
-    right.cmp(left)
 }
 
 struct Newest {
